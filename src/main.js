@@ -1904,6 +1904,8 @@ focusHud = createFocusHud({
   getSnapshot: () => getFocusSnapshot(),
   actions: {
     "add-activity": (payload) => focusModuleRuntime.addActivity(payload),
+    "archive-activity": (payload) => focusModuleRuntime.archiveActivity(payload),
+    "update-activity": (payload) => focusModuleRuntime.updateActivity(payload),
     start: (payload) => { focusNotice = null; return focusModuleRuntime.start(payload); },
     pause: () => focusModuleRuntime.pause(),
     resume: () => focusModuleRuntime.resume(),

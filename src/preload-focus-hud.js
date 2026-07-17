@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld("focusHudAPI", {
   getSnapshot: () => ipcRenderer.invoke("focus:get-snapshot"),
   setExpanded: (value) => ipcRenderer.invoke("focus:set-expanded", !!value),
   addActivity: (payload) => ipcRenderer.invoke("focus:add-activity", payload),
+  archiveActivity: (payload) => ipcRenderer.invoke("focus:archive-activity", payload),
+  updateActivity: (payload) => ipcRenderer.invoke("focus:update-activity", payload),
   start: (payload) => ipcRenderer.invoke("focus:start", payload),
   pause: () => ipcRenderer.invoke("focus:pause"),
   resume: () => ipcRenderer.invoke("focus:resume"),

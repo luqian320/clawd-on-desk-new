@@ -31,8 +31,13 @@
     .actions { display: flex; gap: 6px; }
     .action { height: 29px; border: 0; border-radius: 7px; padding: 0 10px; cursor: pointer; font-weight: 650; background: rgba(76,67,59,.1); color: inherit; }
     .action.primary { flex: 1; color: white; background: var(--tomato); }
+    .action.icon-action { width: 28px; padding: 0; font-size: 16px; }
+    .action.danger { color: #b93d2d; }
     .action:hover { filter: brightness(.96); }
     .hint { margin: 0 0 6px; color: var(--muted); font-size: 10px; }
+    .field-label { align-self: center; color: var(--muted); font-size: 10px; white-space: nowrap; }
+    .goal-input { width: 58px; flex: 0 0 58px; text-align: center; }
+    .back-btn { width: 28px; flex: 0 0 28px; padding: 0; font-size: 17px; }
     .hidden { display: none !important; }
     @media (prefers-color-scheme: dark) {
       :root { --ink: #f5eee7; --muted: #b9aea4; }
@@ -53,8 +58,12 @@
     </button>
     <section class="panel">
       <p id="hint" class="hint">Choose what you want to make time for.</p>
-      <div id="createRow" class="row"><input id="newName" class="name" maxlength="80" placeholder="e.g. AI programming"><input id="dailyTarget" class="minutes" type="number" min="0" max="24" step=".5" value="8" title="Daily target hours"><button id="add" class="action">Add</button></div>
-      <div id="pickRow" class="row hidden"><select id="activity"></select><button id="newActivity" class="action" title="Add activity">＋</button><select id="mode"><option value="pomodoro">Pomodoro</option><option value="stopwatch">Stopwatch</option></select></div>
+      <div id="createRow" class="hidden">
+        <div class="row"><button id="cancelAdd" class="action back-btn" title="Back" aria-label="Back">←</button><input id="newName" class="name" maxlength="80" placeholder="e.g. AI programming"></div>
+        <div class="row"><span class="field-label">Daily goal</span><input id="dailyTarget" class="goal-input" type="number" min="0" max="24" step=".5" value="8"><span class="field-label">hours</span><button id="add" class="action primary">Add</button></div>
+      </div>
+      <div id="pickRow" class="row hidden"><select id="activity"></select><button id="newActivity" class="action icon-action" title="Add activity">＋</button><button id="deleteActivity" class="action icon-action danger" title="Delete activity">×</button><select id="mode"><option value="pomodoro">Pomodoro</option><option value="stopwatch">Stopwatch</option></select></div>
+      <div id="goalRow" class="row hidden"><span class="field-label">Goal</span><input id="goalHours" class="goal-input" type="number" min="0" max="24" step=".5"><span class="field-label">h / day</span></div>
       <div id="durationRow" class="row hidden"><input id="minutes" class="minutes" type="number" min="1" max="480" value="25"><span class="hint" style="align-self:center;margin:0">minutes</span></div>
       <div class="actions"><button id="start" class="action primary hidden">Start</button><button id="pause" class="action primary hidden">Pause</button><button id="resume" class="action primary hidden">Resume</button><button id="finish" class="action hidden">Finish</button></div>
     </section>

@@ -95,6 +95,29 @@ function createFocusRuntime(options = {}) {
     return { status: "ok", activity };
   }
 
+  function archiveActivity(input = {}) {
+    const activityId = typeof input.activityId === "string" ? input.activityId : "";
+    const activity = data.activities.find((item) => item.id === activityId && !item.archivedAt);
+    if (!activity) return { status: "error", message: "Activity not found" };
+    if (data.active && data.active.activityId === activityId) {
+      return { status: "error", message: "Finish the active timer before deleting this activity" };
+    }
+    activity.archivedAt = now();
+    commit();
+    return { status: "ok", activityId };
+  }
+
+  function updateActivity(input = {}) {
+    const activityId = typeof input.activityId === "string" ? input.activityId : "";
+    const activity = data.activities.find((item) => item.id === activityId && !item.archivedAt);
+    if (!activity) return { status: "error", message: "Activity not found" };
+    if (input.dailyTargetMs !== undefined) {
+      activity.dailyTargetMs = Math.max(0, Math.floor(Number(input.dailyTargetMs) || 0));
+    }
+    commit();
+    return { status: "ok", activity: { ...activity } };
+  }
+
   function start(input = {}) {
     if (data.active) return { status: "error", message: "A focus timer is already active" };
     const activity = activityFor(input.activityId);
@@ -213,8 +236,7 @@ function createFocusRuntime(options = {}) {
   function on(event, listener) { emitter.on(event, listener); return () => emitter.off(event, listener); }
 
   emit();
-  return { snapshot, addActivity, start, pause, resume, finish, completePhase, updateConfig, on, dispose };
+  return { snapshot, addActivity, archiveActivity, updateActivity, start, pause, resume, finish, completePhase, updateConfig, on, dispose };
 }
 
 module.exports = { DEFAULTS, elapsedFor, createFocusRuntime };
-

@@ -6,7 +6,7 @@ const { keepOutOfTaskbar } = require("./taskbar");
 
 const WIDTH = 226;
 const COLLAPSED_HEIGHT = 42;
-const EXPANDED_HEIGHT = 174;
+const EXPANDED_HEIGHT = 202;
 const GAP = 6;
 const EDGE = 8;
 
@@ -111,7 +111,7 @@ function createFocusHud(options = {}) {
     onExpandedChange(expanded);
     return { status: "ok" };
   });
-  for (const name of ["add-activity", "start", "pause", "resume", "finish", "update-config"]) {
+  for (const name of ["add-activity", "archive-activity", "update-activity", "start", "pause", "resume", "finish", "update-config"]) {
     handle(`focus:${name}`, (_event, payload) => {
       const fn = actions[name];
       return typeof fn === "function" ? fn(payload || {}) : { status: "error", message: "Unavailable" };

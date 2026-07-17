@@ -3,6 +3,9 @@
 let snapshot = { activities: [], active: null, config: { focusMs: 1500000 } };
 let expanded = false;
 let creatingActivity = false;
+let selectedActivityId = "";
+let addPrompt = "";
+let goalSaveTimer = null;
 const $ = (id) => document.getElementById(id);
 
 function show(id, visible) { $(id).classList.toggle("hidden", !visible); }
@@ -26,16 +29,27 @@ function render(next) {
   snapshot = next || snapshot;
   const active = snapshot.active;
   const hasActivities = snapshot.activities.some((item) => !item.archivedAt);
-  const selectedId = active ? active.activityId : $("activity").value;
+  const selectedId = active ? active.activityId : (selectedActivityId || $("activity").value);
   $("activity").innerHTML = "";
   for (const item of snapshot.activities.filter((value) => !value.archivedAt)) {
     const option = document.createElement("option"); option.value = item.id; option.textContent = item.name; $("activity").appendChild(option);
   }
-  if (selectedId && [...$("activity").options].some((option) => option.value === selectedId)) $("activity").value = selectedId;
+  if (selectedId && [...$("activity").options].some((option) => option.value === selectedId)) {
+    $("activity").value = selectedId;
+    selectedActivityId = selectedId;
+  } else if ($("activity").value) {
+    selectedActivityId = $("activity").value;
+  }
   const stats = snapshot.stats && snapshot.stats.activities
     ? snapshot.stats.activities[active ? active.activityId : $("activity").value]
     : null;
-  if (stats) {
+  const selectedActivity = snapshot.activities.find((item) => item.id === (active ? active.activityId : $("activity").value));
+  if (selectedActivity && document.activeElement !== $("goalHours")) {
+    $("goalHours").value = String((selectedActivity.dailyTargetMs || 0) / 3600000);
+  }
+  if (addPrompt && !active) {
+    $("hint").textContent = addPrompt;
+  } else if (stats) {
     const target = stats.activity.dailyTargetMs > 0 ? ` / ${compactDuration(stats.activity.dailyTargetMs)}` : "";
     $("hint").textContent = `Today ${compactDuration(stats.todayMs)}${target} · Week ${compactDuration(stats.weekMs)} · Total ${compactDuration(stats.allTimeMs)}`;
   } else {
@@ -43,6 +57,7 @@ function render(next) {
   }
   show("createRow", (!hasActivities || creatingActivity) && !active);
   show("pickRow", hasActivities && !active && !creatingActivity);
+  show("goalRow", hasActivities && !active && !creatingActivity);
   show("durationRow", hasActivities && !active && !creatingActivity && $("mode").value === "pomodoro");
   show("start", hasActivities && !active && !creatingActivity);
   show("pause", !!active && active.status === "running");
@@ -76,12 +91,42 @@ $("summary").addEventListener("click", async () => {
   await window.focusHudAPI.setExpanded(expanded);
 });
 $("mode").addEventListener("change", () => render(snapshot));
-$("activity").addEventListener("change", () => render(snapshot));
+$("activity").addEventListener("change", () => { selectedActivityId = $("activity").value; addPrompt = ""; render(snapshot); });
 $("newActivity").addEventListener("click", () => { creatingActivity = true; render(snapshot); $("newName").focus(); });
+$("cancelAdd").addEventListener("click", () => {
+  creatingActivity = false; $("newName").value = ""; addPrompt = ""; render(snapshot);
+});
 $("add").addEventListener("click", async () => {
   const name = $("newName").value.trim(); if (!name) return $("newName").focus();
-  await window.focusHudAPI.addActivity({ name, dailyTargetMs: Number($("dailyTarget").value) * 3600000, remindersEnabled: true });
+  const result = await window.focusHudAPI.addActivity({ name, dailyTargetMs: Number($("dailyTarget").value) * 3600000, remindersEnabled: true });
+  if (!result || result.status !== "ok") return;
+  selectedActivityId = result.activity.id;
+  addPrompt = `Added “${result.activity.name}”. Start it now?`;
   $("newName").value = ""; creatingActivity = false;
+  render(await window.focusHudAPI.getSnapshot());
+});
+$("deleteActivity").addEventListener("click", async () => {
+  const activityId = $("activity").value;
+  const activity = snapshot.activities.find((item) => item.id === activityId);
+  if (!activity || !window.confirm(`Delete “${activity.name}”? Its history will be kept.`)) return;
+  const result = await window.focusHudAPI.archiveActivity({ activityId });
+  if (!result || result.status !== "ok") return;
+  selectedActivityId = ""; addPrompt = "";
+  render(await window.focusHudAPI.getSnapshot());
+});
+async function saveGoal() {
+  const activityId = $("activity").value;
+  const result = await window.focusHudAPI.updateActivity({ activityId, dailyTargetMs: Number($("goalHours").value) * 3600000 });
+  if (!result || result.status !== "ok") return;
+  render(await window.focusHudAPI.getSnapshot());
+}
+$("goalHours").addEventListener("input", () => {
+  if (goalSaveTimer) clearTimeout(goalSaveTimer);
+  goalSaveTimer = setTimeout(() => { goalSaveTimer = null; void saveGoal(); }, 350);
+});
+$("goalHours").addEventListener("blur", () => {
+  if (goalSaveTimer) { clearTimeout(goalSaveTimer); goalSaveTimer = null; }
+  void saveGoal();
 });
 $("start").addEventListener("click", () => window.focusHudAPI.start({ activityId: $("activity").value, mode: $("mode").value, durationMs: Number($("minutes").value) * 60000 }));
 $("pause").addEventListener("click", () => window.focusHudAPI.pause());

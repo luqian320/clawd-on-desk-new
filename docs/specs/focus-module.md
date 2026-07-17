@@ -149,3 +149,8 @@ appear on first launch of a new week; full detail belongs in Dashboard.
 - Added a persisted 90-minute reminder cooldown and suppression while active or in DND.
 - Added per-activity Today / Week / Total summaries directly in the expanded HUD.
 - Clarified the pet context/tray exit action as “Quit Clawd on Desk” and exposed Cmd/Ctrl+Q.
+- After creating an activity, auto-select it and ask whether to start it now.
+- Added activity deletion as history-preserving archive; active activities cannot be deleted.
+- Added Cancel while creating an activity and made “Daily goal (hours)” explicit.
+- Added editing of the daily goal for existing activities.
+- Simplified goal editing after visual QA: compact back icon, visible goal input, and autosave without a Save button.
