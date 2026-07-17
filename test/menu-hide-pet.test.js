@@ -103,11 +103,12 @@ describe("context menu hide pet action (#460)", () => {
 
     const labels = ctx.contextMenu.template.map((item) => item.label);
     const hideIdx = labels.indexOf("Hide Pet");
-    const quitIdx = labels.indexOf("Quit");
+    const quitIdx = labels.indexOf("Quit Clawd on Desk");
     assert.ok(hideIdx !== -1, "context menu should expose Hide Pet");
     assert.strictEqual(quitIdx, labels.length - 1, "Quit should stay the last item");
     assert.strictEqual(hideIdx, quitIdx - 2, "Hide Pet should sit just above Quit");
     assert.strictEqual(ctx.contextMenu.template[hideIdx + 1].type, "separator");
+    assert.strictEqual(ctx.contextMenu.template[quitIdx].accelerator, "CmdOrCtrl+Q");
 
     ctx.contextMenu.template[hideIdx].click();
     assert.strictEqual(toggles, 1);

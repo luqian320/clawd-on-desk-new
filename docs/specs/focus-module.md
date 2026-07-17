@@ -148,3 +148,4 @@ appear on first launch of a new week; full detail belongs in Dashboard.
 - Added once-per-day goal celebrations and 12:00/18:00/21:00 deficit reminders.
 - Added a persisted 90-minute reminder cooldown and suppression while active or in DND.
 - Added per-activity Today / Week / Total summaries directly in the expanded HUD.
+- Clarified the pet context/tray exit action as “Quit Clawd on Desk” and exposed Cmd/Ctrl+Q.

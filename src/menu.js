@@ -264,7 +264,7 @@ module.exports = function initMenu(ctx) {
     });
 
     const quitGroup = [
-      { label: t("quit"), click: () => requestAppQuit() },
+      { label: t("quit"), accelerator: "CmdOrCtrl+Q", click: () => requestAppQuit() },
     ];
 
     const items = joinGroups([stateGroup, noiseGroup, workGroup, systemGroup, appGroup, quitGroup]);
@@ -485,7 +485,7 @@ module.exports = function initMenu(ctx) {
     // separator (native-menu convention), which also keeps Hide/Show Pet
     // directly above the Quit separator (see menu-hide-pet test, #460).
     const quitGroup = [
-      { label: t("quit"), click: () => requestAppQuit() },
+      { label: t("quit"), accelerator: "CmdOrCtrl+Q", click: () => requestAppQuit() },
     ];
 
     const template = joinGroups([stateGroup, workGroup, displayGroup, appGroup, quitGroup]);
