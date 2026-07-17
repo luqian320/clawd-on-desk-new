@@ -252,6 +252,56 @@ describe("agent-runtime-main", () => {
     ]);
   });
 
+  it("shows and resolves passive Codex Desktop approval notifications", () => {
+    const instances = [];
+    const calls = [];
+    const FakeMonitor = makeFakeMonitorClass(instances);
+    const runtime = createAgentRuntimeMain({
+      loadCodexLogMonitor: () => FakeMonitor,
+      loadCodexAgent: () => ({ id: "codex" }),
+      isAgentEnabled: (agentId) => agentId === "codex",
+      updateSession: (...args) => calls.push(["update", ...args]),
+      showCodexNotifyBubble: (...args) => calls.push(["show", ...args]),
+      clearCodexNotifyBubbles: (...args) => calls.push(["clear", ...args]),
+      codexSubagentClassifier: {},
+    });
+    const monitor = runtime.startCodexLogMonitor();
+
+    monitor.emit("codex:desktop", "notification", "response_item:desktop_approval_requested", {
+      cwd: "/repo",
+      codexOriginator: "Codex Desktop",
+      desktopApprovalRequested: true,
+    });
+    monitor.emit("codex:desktop", "working", "response_item:desktop_approval_resolved", {
+      cwd: "/repo",
+      codexOriginator: "Codex Desktop",
+      desktopApprovalResolved: true,
+    });
+
+    assert.deepStrictEqual(calls, [
+      ["update", "codex:desktop", "notification", "response_item:desktop_approval_requested", {
+        cwd: "/repo",
+        agentId: "codex",
+        sessionTitle: undefined,
+        codexOriginator: "Codex Desktop",
+        headless: false,
+      }],
+      ["show", {
+        sessionId: "codex:desktop",
+        command: "",
+        sticky: true,
+      }],
+      ["clear", "codex:desktop", "codex-desktop-approval-resolved"],
+      ["update", "codex:desktop", "working", "response_item:desktop_approval_resolved", {
+        cwd: "/repo",
+        agentId: "codex",
+        sessionTitle: undefined,
+        codexOriginator: "Codex Desktop",
+        headless: false,
+      }],
+    ]);
+  });
+
   it("starts and stops the Codex monitor through agent gate hooks and cleanup", () => {
     const instances = [];
     const FakeMonitor = makeFakeMonitorClass(instances);

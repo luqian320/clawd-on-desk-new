@@ -24,6 +24,27 @@ const {
   extractAssistantTextFromRecord,
 } = require("../hooks/codex-assistant-output");
 
+const DESKTOP_APPROVAL_EVENT = "response_item:desktop_approval_requested";
+const DESKTOP_APPROVAL_RESOLVED_EVENT = "response_item:desktop_approval_resolved";
+
+function detectCodexDesktopApprovalRequest(obj, tracked) {
+  if (!obj || obj.type !== "response_item") return null;
+  const payload = obj.payload && typeof obj.payload === "object" ? obj.payload : null;
+  if (!payload || payload.type !== "custom_tool_call" || payload.name !== "exec") return null;
+  if (String(tracked && tracked.codexOriginator || "").trim().toLowerCase() !== "codex desktop") return null;
+  const input = typeof payload.input === "string" ? payload.input : "";
+  if (!/sandbox_permissions\s*:\s*["']require_escalated["']/.test(input)) return null;
+  const callId = typeof payload.call_id === "string" && payload.call_id ? payload.call_id : null;
+  return callId ? { callId } : null;
+}
+
+function getCustomToolOutputCallId(obj) {
+  if (!obj || obj.type !== "response_item") return null;
+  const payload = obj.payload && typeof obj.payload === "object" ? obj.payload : null;
+  if (!payload || payload.type !== "custom_tool_call_output") return null;
+  return typeof payload.call_id === "string" && payload.call_id ? payload.call_id : null;
+}
+
 const MAX_TRACKED_FILES = 50;
 const MAX_RETIRED_TRACKED_FILES = 100;
 const MAX_PARTIAL_BYTES = 65536;
@@ -344,6 +365,7 @@ class CodexLogMonitor {
         assistantLastOutput: retired ? retired.assistantLastOutput || null : null,
         assistantLastOutputTruncated: retired ? retired.assistantLastOutputTruncated === true : false,
         contextUsage: retired ? retired.contextUsage || null : null,
+        pendingDesktopApprovalCallIds: new Set(),
         // Backfill mode: only a file whose last write predates monitor
         // start (by more than BACKFILL_GRACE_MS) is treated as stale
         // history — we replay it silently to advance offset + pick up
@@ -424,6 +446,34 @@ class CodexLogMonitor {
     if (obj && typeof obj.timestamp === "string") {
       const ts = Date.parse(obj.timestamp);
       if (!tracked.backfilling && Number.isFinite(ts) && ts < this._startedAtMs - 1500) return;
+    }
+
+    const desktopApproval = detectCodexDesktopApprovalRequest(obj, tracked);
+    if (desktopApproval) {
+      tracked.pendingDesktopApprovalCallIds.add(desktopApproval.callId);
+      tracked.lastStateEvent = DESKTOP_APPROVAL_EVENT;
+      tracked.lastState = "notification";
+      if (!tracked.backfilling) {
+        this._emitStateChange(tracked, "notification", DESKTOP_APPROVAL_EVENT, {
+          desktopApprovalRequested: true,
+          desktopApprovalCallId: desktopApproval.callId,
+        });
+      }
+      return;
+    }
+
+    const completedCallId = getCustomToolOutputCallId(obj);
+    if (completedCallId && tracked.pendingDesktopApprovalCallIds.has(completedCallId)) {
+      tracked.pendingDesktopApprovalCallIds.delete(completedCallId);
+      tracked.lastStateEvent = DESKTOP_APPROVAL_RESOLVED_EVENT;
+      tracked.lastState = "working";
+      if (!tracked.backfilling) {
+        this._emitStateChange(tracked, "working", DESKTOP_APPROVAL_RESOLVED_EVENT, {
+          desktopApprovalResolved: true,
+          desktopApprovalCallId: completedCallId,
+        });
+      }
+      return;
     }
 
     const assistantText = extractAssistantTextFromRecord(obj);
@@ -705,3 +755,9 @@ class CodexLogMonitor {
 }
 
 module.exports = CodexLogMonitor;
+module.exports.__test = {
+  DESKTOP_APPROVAL_EVENT,
+  DESKTOP_APPROVAL_RESOLVED_EVENT,
+  detectCodexDesktopApprovalRequest,
+  getCustomToolOutputCallId,
+};

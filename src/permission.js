@@ -1891,6 +1891,12 @@ function handleDecide(event, behavior) {
   permLog(`IPC permission-decide: behavior=${behavior} matched=${!!perm}`);
   if (!perm) return;
   if (perm.isCodexNotify || perm.isKimiNotify) {
+    if (perm.isCodexNotify && behavior === "deny-and-focus") {
+      ctx.focusTerminalForSession(perm.sessionId, {
+        requestSource: "codex-desktop-approval-notify",
+        fallbackEntry: buildPermissionFocusEntry(perm),
+      });
+    }
     dismissPassiveNotify(perm, "ipc-decide");
     return;
   }
@@ -2001,7 +2007,7 @@ function handleDecide(event, behavior) {
   }
 }
 
-function showCodexNotifyBubble({ sessionId, command }) {
+function showCodexNotifyBubble({ sessionId, command, sticky = false }) {
   if (shouldSuppressCodexNotifyBubble(ctx)) {
     const policy = getPolicy(ctx, "notification");
     permLog(`codex notify suppressed: session=${sessionId} dnd=${ctx.doNotDisturb} notificationEnabled=${policy.enabled}`);
@@ -2012,6 +2018,7 @@ function showCodexNotifyBubble({ sessionId, command }) {
   if (existing) {
     existing.toolInput = { command: command || "(unknown)" };
     existing.createdAt = Date.now();
+    existing.stickyPassiveNotify = sticky === true;
     permLog(`passive notify refresh: agent=codex session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
     syncPermissionBubbleContent(existing);
     schedulePassiveNotifyAutoExpire(existing, policy.autoCloseMs);
@@ -2026,6 +2033,7 @@ function showCodexNotifyBubble({ sessionId, command }) {
     resolvedSuggestion: null, createdAt: Date.now(),
     isElicitation: false, isCodexNotify: true,
     agentId: "codex",
+    stickyPassiveNotify: sticky === true,
     autoExpireTimer: null,
   };
   addPendingPermission(permEntry, "passive-added");
@@ -2100,6 +2108,12 @@ function schedulePassiveNotifyAutoExpire(permEntry, autoCloseMs, now = Date.now(
   if (permEntry.autoExpireTimer) {
     clearTimeout(permEntry.autoExpireTimer);
     permEntry.autoExpireTimer = null;
+  }
+  if (permEntry.stickyPassiveNotify === true) {
+    permLog(
+      `passive notify sticky: agent=${getPassiveNotifyAgentId(permEntry)} session=${permEntry.sessionId || "(none)"}`
+    );
+    return false;
   }
   const remainingMs = computePassiveNotifyRemainingMs(permEntry.createdAt, autoCloseMs, now);
   permLog(

@@ -32,6 +32,7 @@ let elicitationQuestions = [];
 let elicitationAnswers = {};
 let activeQuestionIndex = 0;
 let currentLang = "en";
+let codexNotifyMode = false;
 let heightReportFrame = 0;
 
 // Mirrors body { padding: 6px; } above. Keep this in sync if the body padding changes.
@@ -78,6 +79,9 @@ const BUBBLE_STRINGS = {
     other: "Other",
     otherPlaceholder: "Type your answer…",
     codexPermission: "Codex Permission",
+    codexWaitingApproval: "Codex is waiting for approval",
+    goToCodex: "Go to Codex",
+    reviewInCodex: "Open Codex to approve or reject this request.",
     codexToolApproval: "Codex Tool Approval",
     kimiPermission: "Kimi Permission",
     checkKimiTerminal: "Approve or reject this request in the Kimi terminal.",
@@ -114,6 +118,9 @@ const BUBBLE_STRINGS = {
     other: "\u5176\u4ED6",
     otherPlaceholder: "\u8F93\u5165\u4F60\u7684\u56DE\u7B54\u2026",
     codexPermission: "Codex \u6743\u9650\u8BF7\u6C42",
+    codexWaitingApproval: "Codex \u7B49\u5F85\u4F60\u6279\u51C6",
+    goToCodex: "\u524D\u5F80 Codex",
+    reviewInCodex: "\u8BF7\u524D\u5F80 Codex \u6279\u51C6\u6216\u62D2\u7EDD\u8FD9\u4E2A\u8BF7\u6C42\u3002",
     codexToolApproval: "Codex \u5DE5\u5177\u8C03\u7528\u5BA1\u6279",
     kimiPermission: "Kimi \u6743\u9650\u8BF7\u6C42",
     checkKimiTerminal: "\u8BF7\u5728 Kimi \u7EC8\u7AEF\u4E2D\u6279\u51C6\u6216\u62D2\u7EDD\u8BE5\u8BF7\u6C42\u3002",
@@ -340,6 +347,7 @@ function resetBubbleContent() {
     heightReportFrame = 0;
   }
   elicitationMode = false;
+  codexNotifyMode = false;
   elicitationQuestions = [];
   elicitationAnswers = {};
   activeQuestionIndex = 0;
@@ -798,12 +806,13 @@ function show(data) {
 
   // Codex notify mode — informational bubble with Dismiss button only
   if (data.toolName === "CodexExec") {
-    headerTitle.textContent = bubbleText(data.lang, "codexPermission");
+    codexNotifyMode = true;
+    headerTitle.textContent = bubbleText(data.lang, "codexWaitingApproval");
     toolPillText.textContent = "CODEX";
     toolPill.setAttribute("data-tool", "CodexExec");
     toolPill.style.display = "";
-    commandBlock.textContent = (data.toolInput && data.toolInput.command) || "(unknown)";
-    btnAllow.textContent = bubbleText(data.lang, "gotIt");
+    commandBlock.textContent = (data.toolInput && data.toolInput.command) || bubbleText(data.lang, "reviewInCodex");
+    btnAllow.textContent = bubbleText(data.lang, "goToCodex");
     btnAllow.disabled = false;
     btnDeny.style.display = "none";
     suggestionsContainer.innerHTML = "";
@@ -948,6 +957,12 @@ function handleElicitationBackAction() {
 btnAllow.addEventListener("click", () => {
   if (elicitationMode) {
     handleElicitationPrimaryAction();
+    return;
+  }
+  if (codexNotifyMode) {
+    btnAllow.textContent = "...";
+    disableAll();
+    window.bubbleAPI.decide("deny-and-focus");
     return;
   }
   btnAllow.textContent = "...";

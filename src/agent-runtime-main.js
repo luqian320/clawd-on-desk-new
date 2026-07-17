@@ -37,6 +37,7 @@ function createAgentRuntimeMain(options = {}) {
   const updateSession = options.updateSession || (() => {});
   const captureGhosttyTerminalId = options.captureGhosttyTerminalId || null;
   const clearCodexNotifyBubbles = options.clearCodexNotifyBubbles || (() => {});
+  const showCodexNotifyBubble = options.showCodexNotifyBubble || (() => {});
 
   let codexMonitor = null;
   const codexOfficialHookSessions = new Map();
@@ -171,6 +172,24 @@ function createAgentRuntimeMain(options = {}) {
       const CodexLogMonitor = loadCodexLogMonitor();
       const codexAgent = loadCodexAgent();
       codexMonitor = new CodexLogMonitor(codexAgent, (sid, state, event, extra) => {
+        if (extra && extra.desktopApprovalRequested === true) {
+          updateSession(sid, state, event, buildCodexMonitorUpdateOptions(extra, {
+            includeHeadless: true,
+          }));
+          showCodexNotifyBubble({
+            sessionId: sid,
+            command: "",
+            sticky: true,
+          });
+          return;
+        }
+        if (extra && extra.desktopApprovalResolved === true) {
+          clearCodexNotifyBubbles(sid, "codex-desktop-approval-resolved");
+          updateSession(sid, state, event, buildCodexMonitorUpdateOptions(extra, {
+            includeHeadless: true,
+          }));
+          return;
+        }
         if (isCodexMonitorMetadataOnlyEvent(event, extra)) {
           const metadataOptions = buildCodexMonitorUpdateOptions(extra, {
             includeHeadless: true,

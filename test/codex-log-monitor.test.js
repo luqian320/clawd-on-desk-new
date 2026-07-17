@@ -5,6 +5,7 @@ const path = require("path");
 const os = require("os");
 const CodexLogMonitor = require("../agents/codex-log-monitor");
 const codexConfig = require("../agents/codex");
+const { detectCodexDesktopApprovalRequest, getCustomToolOutputCallId } = CodexLogMonitor.__test;
 
 // Helper: create a temp session dir with today's date structure
 function makeTempSessionDir() {
@@ -43,6 +44,34 @@ describe("CodexLogMonitor", () => {
   afterEach(() => {
     if (monitor) monitor.stop();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("detects only Codex Desktop escalated exec approvals and pairs their output", () => {
+    const approval = {
+      type: "response_item",
+      payload: {
+        type: "custom_tool_call",
+        name: "exec",
+        call_id: "call-approval-1",
+        input: 'await tools.exec_command({ cmd: "npm start", sandbox_permissions: "require_escalated" })',
+      },
+    };
+    assert.deepStrictEqual(
+      detectCodexDesktopApprovalRequest(approval, { codexOriginator: "Codex Desktop" }),
+      { callId: "call-approval-1" }
+    );
+    assert.strictEqual(
+      detectCodexDesktopApprovalRequest(approval, { codexOriginator: "codex-cli" }),
+      null
+    );
+    assert.strictEqual(detectCodexDesktopApprovalRequest({
+      ...approval,
+      payload: { ...approval.payload, input: 'await tools.exec_command({ cmd: "npm test" })' },
+    }, { codexOriginator: "Codex Desktop" }), null);
+    assert.strictEqual(getCustomToolOutputCallId({
+      type: "response_item",
+      payload: { type: "custom_tool_call_output", call_id: "call-approval-1" },
+    }), "call-approval-1");
   });
 
   it("should extract session ID from filename", (_, done) => {
