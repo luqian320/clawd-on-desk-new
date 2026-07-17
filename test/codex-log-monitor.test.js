@@ -60,6 +60,16 @@ describe("CodexLogMonitor", () => {
       detectCodexDesktopApprovalRequest(approval, { codexOriginator: "Codex Desktop" }),
       { callId: "call-approval-1" }
     );
+    assert.deepStrictEqual(
+      detectCodexDesktopApprovalRequest({
+        ...approval,
+        payload: {
+          ...approval.payload,
+          input: 'await tools.exec_command({"cmd":"npm start","sandbox_permissions":"require_escalated"})',
+        },
+      }, { codexOriginator: "Codex Desktop" }),
+      { callId: "call-approval-1" }
+    );
     assert.strictEqual(
       detectCodexDesktopApprovalRequest(approval, { codexOriginator: "codex-cli" }),
       null

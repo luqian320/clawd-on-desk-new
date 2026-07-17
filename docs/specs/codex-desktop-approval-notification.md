@@ -6,9 +6,13 @@ Mirror Codex Desktop approval waits through the existing Clawd notification bubb
 
 ## Detection
 
-Codex Desktop currently records host-owned approval requests as `response_item.custom_tool_call` entries. The local monitor treats an `exec` call containing `sandbox_permissions: "require_escalated"` as a best-effort approval-wait signal, only when session metadata identifies `originator = "Codex Desktop"`.
+Codex Desktop currently records host-owned approval requests as `response_item.custom_tool_call` entries. The local monitor treats an `exec` call containing `sandbox_permissions: "require_escalated"` as a best-effort approval-wait signal, only when session metadata identifies `originator = "Codex Desktop"`. Both JavaScript-style keys and quoted JSON-style keys are accepted because Desktop emits both serializations.
 
 The matching `custom_tool_call_output.call_id` resolves the notification automatically. Command contents are not copied into the bubble. Approval-wait bubbles are sticky: they remain visible until the call resolves or the user chooses **Go to Codex**.
+
+## Visual skins
+
+The approval notice uses the same `focusHudStyle` preference as the Focus HUD. Pixel is the default; switching the Focus HUD between pixel and modern refreshes any visible Codex approval notice immediately. Other permission bubbles keep their existing appearance.
 
 ## Safety and compatibility
 

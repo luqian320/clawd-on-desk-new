@@ -33,7 +33,7 @@ function detectCodexDesktopApprovalRequest(obj, tracked) {
   if (!payload || payload.type !== "custom_tool_call" || payload.name !== "exec") return null;
   if (String(tracked && tracked.codexOriginator || "").trim().toLowerCase() !== "codex desktop") return null;
   const input = typeof payload.input === "string" ? payload.input : "";
-  if (!/sandbox_permissions\s*:\s*["']require_escalated["']/.test(input)) return null;
+  if (!/["']?sandbox_permissions["']?\s*:\s*["']require_escalated["']/.test(input)) return null;
   const callId = typeof payload.call_id === "string" && payload.call_id ? payload.call_id : null;
   return callId ? { callId } : null;
 }

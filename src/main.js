@@ -1336,6 +1336,7 @@ const _permCtx = {
   getHitRectScreen,
   getHudReservedOffset: () => getSessionHudReservedOffset(),
   getTextScale: () => getTextScaleForPetWindows(),
+  getFocusHudStyle: () => _settingsController.get("focusHudStyle") || "pixel",
   guardAlwaysOnTop,
   reapplyMacVisibility,
   isAgentPermissionsEnabled: (agentId) =>
@@ -1373,7 +1374,7 @@ const _permCtx = {
   },
 };
 const _perm = initPermission(_permCtx);
-const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, maybeStartRemoteApproval, showCodexNotifyBubble, clearCodexNotifyBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionShortcuts, replyOpencodePermission } = _perm;
+const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, maybeStartRemoteApproval, showCodexNotifyBubble, clearCodexNotifyBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionBubbleStyles, syncPermissionShortcuts, replyOpencodePermission } = _perm;
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
@@ -1986,6 +1987,7 @@ _settingsController.subscribeKey("lang", () => {
 });
 _settingsController.subscribeKey("focusHudStyle", () => {
   if (focusHud) focusHud.broadcast(getFocusSnapshot());
+  syncPermissionBubbleStyles();
 });
 
 agentRuntime = createAgentRuntimeMain({

@@ -887,6 +887,9 @@ function buildPermissionBubblePayload(permEntry) {
     opencodePatterns: permEntry.opencodePatterns || [],
     sessionFolder,
     sessionShortId,
+    uiStyle: typeof ctx.getFocusHudStyle === "function"
+      ? ctx.getFocusHudStyle()
+      : "pixel",
   };
 }
 
@@ -895,6 +898,12 @@ function syncPermissionBubbleContent(permEntry) {
   if (!bub || bub.isDestroyed() || !permEntry.bubbleReady) return false;
   bub.webContents.send("permission-show", buildPermissionBubblePayload(permEntry));
   return true;
+}
+
+function syncPermissionBubbleStyles() {
+  for (const permEntry of pendingPermissions) {
+    syncPermissionBubbleContent(permEntry);
+  }
 }
 
 function basenameForDisplay(value) {
@@ -2293,6 +2302,7 @@ return {
   refreshPermissionAutoCloseForPolicy,
   dismissPermissionsByAgent, dismissInteractivePermissionBubbles,
   dismissPermissionsForDnd,
+  syncPermissionBubbleStyles,
   syncPermissionShortcuts,
   replyOpencodePermission,
 };

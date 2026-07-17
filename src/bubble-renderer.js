@@ -157,6 +157,9 @@ const BUBBLE_STRINGS = {
     other: "其他",
     otherPlaceholder: "輸入你的回答…",
     codexPermission: "Codex 權限請求",
+    codexWaitingApproval: "Codex 正在等待你的批准",
+    goToCodex: "前往 Codex",
+    reviewInCodex: "請前往 Codex 允許或拒絕此請求。",
     codexToolApproval: "Codex 工具呼叫審批",
     kimiPermission: "Kimi 權限請求",
     checkKimiTerminal: "請在 Kimi 終端機中允許或拒絕此請求。",
@@ -193,6 +196,9 @@ const BUBBLE_STRINGS = {
     other: "\uAE30\uD0C0",
     otherPlaceholder: "\uC9C1\uC811 \uC785\uB825\u2026",
     codexPermission: "Codex \uAD8C\uD55C \uC694\uCCAD",
+    codexWaitingApproval: "Codex\uAC00 \uC2B9\uC778\uC744 \uAE30\uB2E4\uB9AC\uACE0 \uC788\uC2B5\uB2C8\uB2E4",
+    goToCodex: "Codex\uB85C \uC774\uB3D9",
+    reviewInCodex: "Codex\uC5D0\uC11C \uC774 \uC694\uCCAD\uC744 \uC2B9\uC778\uD558\uAC70\uB098 \uAC70\uBD80\uD558\uC138\uC694.",
     codexToolApproval: "Codex \uB3C4\uAD6C \uD638\uCD9C \uC2B9\uC778",
     kimiPermission: "Kimi \uAD8C\uD55C \uC694\uCCAD",
     checkKimiTerminal: "Kimi \uD130\uBBF8\uB110\uC5D0\uC11C \uC774 \uC694\uCCAD\uC744 \uD5C8\uC6A9\uD558\uAC70\uB098 \uAC70\uBD80\uD558\uC138\uC694.",
@@ -229,6 +235,9 @@ const BUBBLE_STRINGS = {
     other: "その他",
     otherPlaceholder: "回答を入力…",
     codexPermission: "Codex 権限リクエスト",
+    codexWaitingApproval: "Codex が承認を待っています",
+    goToCodex: "Codex へ移動",
+    reviewInCodex: "Codex でこのリクエストを承認または拒否してください。",
     codexToolApproval: "Codex ツール呼び出しの承認",
     kimiPermission: "Kimi 権限リクエスト",
     checkKimiTerminal: "Kimi ターミナルでこのリクエストを許可または拒否してください。",
@@ -348,6 +357,7 @@ function resetBubbleContent() {
   }
   elicitationMode = false;
   codexNotifyMode = false;
+  card.classList.remove("codex-notify", "skin-modern", "skin-pixel");
   elicitationQuestions = [];
   elicitationAnswers = {};
   activeQuestionIndex = 0;
@@ -807,6 +817,8 @@ function show(data) {
   // Codex notify mode — informational bubble with Dismiss button only
   if (data.toolName === "CodexExec") {
     codexNotifyMode = true;
+    const uiStyle = data.uiStyle === "modern" ? "modern" : "pixel";
+    card.classList.add("codex-notify", `skin-${uiStyle}`);
     headerTitle.textContent = bubbleText(data.lang, "codexWaitingApproval");
     toolPillText.textContent = "CODEX";
     toolPill.setAttribute("data-tool", "CodexExec");
