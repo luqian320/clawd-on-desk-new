@@ -17,7 +17,7 @@ const COPY = {
     added: "已添加“{name}”，现在开始吗？", deleteConfirm: "删除“{name}”吗？历史记录会保留。",
     dailyGoal: "每日目标", goal: "目标", hours: "小时", hoursPerDay: "小时 / 天", minutes: "分钟",
     add: "添加", start: "开始", pause: "暂停", resume: "继续", finish: "结束", back: "返回",
-    addActivity: "添加事项", deleteActivity: "删除事项", namePlaceholder: "例如：AI 编程",
+    addActivity: "添加事项", deleteActivity: "删除事项", namePlaceholder: "例如：AI 编程", switchStyle: "切换现代 / 像素界面",
   },
   en: {
     startFocus: "Start focus", pomodoro: "Pomodoro", stopwatch: "Stopwatch", paused: "Paused",
@@ -27,7 +27,7 @@ const COPY = {
     added: "Added “{name}”. Start it now?", deleteConfirm: "Delete “{name}”? Its history will be kept.",
     dailyGoal: "Daily goal", goal: "Goal", hours: "hours", hoursPerDay: "h / day", minutes: "minutes",
     add: "Add", start: "Start", pause: "Pause", resume: "Resume", finish: "Finish", back: "Back",
-    addActivity: "Add activity", deleteActivity: "Delete activity", namePlaceholder: "e.g. AI programming",
+    addActivity: "Add activity", deleteActivity: "Delete activity", namePlaceholder: "e.g. AI programming", switchStyle: "Switch modern / pixel UI",
   },
 };
 
@@ -47,6 +47,7 @@ function applyLanguage() {
   $("start").textContent = t("start"); $("pause").textContent = t("pause");
   $("resume").textContent = t("resume"); $("finish").textContent = t("finish");
   $("newActivity").title = t("addActivity"); $("deleteActivity").title = t("deleteActivity");
+  $("styleToggle").title = t("switchStyle"); $("styleToggle").setAttribute("aria-label", t("switchStyle"));
   $("mode").options[0].textContent = t("pomodoro"); $("mode").options[1].textContent = t("stopwatch");
 }
 
@@ -69,8 +70,10 @@ function compactDuration(ms) {
 }
 
 function render(next) {
-  snapshot = next || snapshot;
+  const previousStyle = snapshot.uiStyle || "pixel";
+  snapshot = next ? { ...snapshot, ...next, uiStyle: next.uiStyle || previousStyle } : snapshot;
   applyLanguage();
+  $("card").classList.toggle("pixel", snapshot.uiStyle === "pixel");
   const active = snapshot.active;
   const hasActivities = snapshot.activities.some((item) => !item.archivedAt);
   const selectedId = active ? active.activityId : (selectedActivityId || $("activity").value);
@@ -101,8 +104,8 @@ function render(next) {
   }
   show("createRow", (!hasActivities || creatingActivity) && !active);
   show("pickRow", hasActivities && !active && !creatingActivity);
-  show("goalRow", hasActivities && !active && !creatingActivity);
-  show("durationRow", hasActivities && !active && !creatingActivity && $("mode").value === "pomodoro");
+  show("settingsRow", hasActivities && !active && !creatingActivity);
+  show("durationGroup", hasActivities && !active && !creatingActivity && $("mode").value === "pomodoro");
   show("start", hasActivities && !active && !creatingActivity);
   show("pause", !!active && active.status === "running");
   show("resume", !!active && active.status === "paused");
@@ -133,6 +136,11 @@ function render(next) {
 $("summary").addEventListener("click", async () => {
   expanded = !expanded; $("card").classList.toggle("expanded", expanded); $("summary").setAttribute("aria-expanded", String(expanded));
   await window.focusHudAPI.setExpanded(expanded);
+});
+$("styleToggle").addEventListener("click", async () => {
+  const nextStyle = $("card").classList.contains("pixel") ? "modern" : "pixel";
+  const result = await window.focusHudAPI.setStyle(nextStyle);
+  if (result && result.status === "ok") render(await window.focusHudAPI.getSnapshot());
 });
 $("mode").addEventListener("change", () => render(snapshot));
 $("activity").addEventListener("change", () => { selectedActivityId = $("activity").value; addPrompt = ""; render(snapshot); });

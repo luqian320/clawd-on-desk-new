@@ -252,6 +252,11 @@ const updateRegistry = {
   sessionHudShowContextUsage: requireBoolean("sessionHudShowContextUsage"),
   sessionHudCleanupDetached: requireBoolean("sessionHudCleanupDetached"),
   sessionHudPinned: requireBoolean("sessionHudPinned"),
+  focusHudStyle(value) {
+    return value === "modern" || value === "pixel"
+      ? { status: "ok" }
+      : { status: "error", message: "focusHudStyle must be modern or pixel" };
+  },
   hideBubbles: requireBoolean("hideBubbles"),
   permissionBubblesEnabled: requireBoolean("permissionBubblesEnabled"),
   autoApproveAllPermissions: requireBoolean("autoApproveAllPermissions"),

@@ -12,32 +12,38 @@
     button, input, select { font: inherit; }
     .card { position: relative; overflow: hidden; width: 100%; height: 100%; border: 1px solid rgba(82,67,53,.2); border-radius: 10px; background: rgba(255,252,247,.94); box-shadow: 0 5px 16px rgba(51,36,24,.16); backdrop-filter: blur(12px); }
     .rail { position: absolute; inset: 0 auto auto 0; height: 3px; width: calc(var(--progress, 1) * 100%); background: var(--tomato); transition: width .3s linear; }
-    .summary { height: 34px; width: 100%; display: flex; align-items: center; gap: 8px; padding: 4px 9px 2px; border: 0; color: inherit; background: transparent; cursor: pointer; text-align: left; }
+    .summary { height: 36px; width: 100%; display: flex; align-items: center; gap: 8px; padding: 4px 36px 3px 9px; border: 0; color: inherit; background: transparent; cursor: pointer; text-align: left; }
     .tomato { width: 17px; height: 17px; border-radius: 50% 48% 52% 45%; background: var(--tomato); box-shadow: inset -2px -2px rgba(115,33,19,.18); position: relative; flex: 0 0 auto; }
     .tomato::before { content: ""; position: absolute; width: 7px; height: 4px; left: 5px; top: -2px; background: #477b4b; clip-path: polygon(50% 100%,0 0,45% 35%,100% 0); }
     .copy { min-width: 0; flex: 1; }
     .label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
-    .sub { color: var(--muted); font-size: 10px; }
+    .sub { display: block; overflow: hidden; color: var(--muted); font-size: 10px; line-height: 12px; text-overflow: ellipsis; white-space: nowrap; }
     .time { font: 650 15px/1 ui-monospace, "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; letter-spacing: -.3px; }
     .chev { color: var(--muted); transform: rotate(0); transition: transform .12s ease; }
+    .style-toggle { position: absolute; z-index: 3; right: 5px; top: 7px; width: 22px; height: 22px; border: 0; border-radius: 5px; padding: 0; color: var(--muted); background: transparent; cursor: pointer; font: 700 13px/1 ui-monospace, monospace; }
+    .style-toggle:hover { color: var(--tomato); background: rgba(232,93,63,.09); }
     .expanded .chev { transform: rotate(180deg); }
-    .panel { display: none; border-top: 1px solid rgba(82,67,53,.12); padding: 8px; }
+    .panel { display: none; border-top: 1px solid rgba(82,67,53,.12); padding: 7px 8px 8px; }
     .expanded .panel { display: block; }
-    .row { display: flex; gap: 6px; margin-bottom: 7px; }
-    input, select { min-width: 0; height: 27px; border: 1px solid rgba(82,67,53,.22); border-radius: 6px; padding: 0 7px; color: inherit; background: rgba(255,255,255,.55); outline: none; }
-    select, .name { flex: 1; }
-    .minutes { width: 58px; }
+    .row { margin-bottom: 6px; }
+    .pick-row { display: grid; grid-template-columns: minmax(0, 1fr) 28px 28px 78px; gap: 5px; }
+    .create-name-row { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 5px; }
+    .create-goal-row { display: grid; grid-template-columns: auto 52px auto minmax(56px, 1fr); align-items: center; gap: 5px; }
+    .settings-row { display: grid; grid-template-columns: auto 52px auto 1fr; align-items: center; gap: 5px; }
+    .duration-group { display: grid; grid-template-columns: 52px auto; align-items: center; justify-content: end; gap: 5px; }
+    input, select { min-width: 0; width: 100%; height: 28px; border: 1px solid rgba(82,67,53,.22); border-radius: 6px; padding: 0 7px; color: inherit; background: rgba(255,255,255,.55); outline: none; }
+    .minutes { width: 52px; text-align: center; }
     input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid rgba(232,93,63,.7); outline-offset: 1px; }
-    .actions { display: flex; gap: 6px; }
-    .action { height: 29px; border: 0; border-radius: 7px; padding: 0 10px; cursor: pointer; font-weight: 650; background: rgba(76,67,59,.1); color: inherit; }
+    .actions { display: flex; gap: 6px; min-height: 30px; }
+    .action { height: 30px; border: 0; border-radius: 7px; padding: 0 10px; cursor: pointer; font-weight: 650; background: rgba(76,67,59,.1); color: inherit; }
     .action.primary { flex: 1; color: white; background: var(--tomato); }
     .action.icon-action { width: 28px; padding: 0; font-size: 16px; }
     .action.danger { color: #b93d2d; }
     .action:hover { filter: brightness(.96); }
-    .hint { margin: 0 0 6px; color: var(--muted); font-size: 10px; }
+    .hint { min-height: 12px; margin: 0 0 6px; overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
     .field-label { align-self: center; color: var(--muted); font-size: 10px; white-space: nowrap; }
-    .goal-input { width: 58px; flex: 0 0 58px; text-align: center; }
-    .back-btn { width: 28px; flex: 0 0 28px; padding: 0; font-size: 17px; }
+    .goal-input { width: 52px; text-align: center; }
+    .back-btn { width: 28px; padding: 0; font-size: 17px; }
     .hidden { display: none !important; }
     @media (prefers-color-scheme: dark) {
       :root { --ink: #f5eee7; --muted: #b9aea4; }
@@ -46,6 +52,27 @@
       .panel { border-color: rgba(255,255,255,.1); }
     }
     @media (prefers-reduced-motion: reduce) { .rail, .chev { transition: none; } }
+
+    /* Pixel HUD: a tiny handheld status panel, not a reskin of the rounded card. */
+    .card.pixel { --ink: #3a261b; --muted: #76513a; border: 2px solid #4b2e1f; border-radius: 0; background: #fff1bd; box-shadow: 4px 4px 0 #b9673e, 7px 7px 0 rgba(61,35,24,.28); backdrop-filter: none; font-family: Monaco, "Courier New", monospace; }
+    .card.pixel .rail { height: 4px; background: #e64e36; image-rendering: pixelated; }
+    .card.pixel .summary { height: 36px; padding: 4px 36px 3px 7px; }
+    .card.pixel .tomato { border-radius: 0; width: 16px; height: 16px; clip-path: polygon(25% 0,75% 0,75% 12%,88% 12%,88% 25%,100% 25%,100% 75%,88% 75%,88% 88%,75% 88%,75% 100%,25% 100%,25% 88%,12% 88%,12% 75%,0 75%,0 25%,12% 25%,12% 12%,25% 12%); box-shadow: none; }
+    .card.pixel .tomato::before { border-radius: 0; }
+    .card.pixel .panel { border-top: 2px solid #4b2e1f; padding-top: 6px; }
+    .card.pixel input, .card.pixel select { border: 2px solid #6a4630; border-radius: 0; background: #fff9df; box-shadow: inset 2px 2px 0 rgba(75,46,31,.12); }
+    .card.pixel .action, .card.pixel .style-toggle { border: 2px solid #5d3927; border-radius: 0; background: #f3c76e; box-shadow: 2px 2px 0 #9b5937; }
+    .card.pixel .action:active, .card.pixel .style-toggle:active { transform: translate(2px,2px); box-shadow: none; }
+    .card.pixel .action.primary { color: #fff8dd; background: #df5438; text-shadow: 1px 1px 0 #7d2e23; }
+    .card.pixel .danger { color: #9d2f27; background: #f0b46c; }
+    .card.pixel .label, .card.pixel .time { text-shadow: 1px 1px 0 rgba(255,255,255,.7); }
+    @media (prefers-color-scheme: dark) {
+      .card.pixel { --ink: #f8e7b0; --muted: #d7b679; background: #30231d; border-color: #e3aa59; box-shadow: 4px 4px 0 #8f3f31, 7px 7px 0 rgba(0,0,0,.5); }
+      .card.pixel .panel { border-color: #e3aa59; }
+      .card.pixel input, .card.pixel select { color: #f8e7b0; background: #493329; border-color: #c68a4b; }
+      .card.pixel .action, .card.pixel .style-toggle { color: #2d2019; border-color: #e3aa59; }
+      .card.pixel .label, .card.pixel .time { text-shadow: 1px 1px 0 #000; }
+    }
   </style>
 </head>
 <body>
@@ -56,15 +83,15 @@
       <span class="copy"><span id="label" class="label">开始专注</span><span id="sub" class="sub">25 分钟番茄钟</span></span>
       <span id="time" class="time hidden">25:00</span><span class="chev">⌄</span>
     </button>
+    <button id="styleToggle" class="style-toggle" title="切换界面风格" aria-label="切换界面风格">▦</button>
     <section class="panel">
       <p id="hint" class="hint">选择你想投入时间的事情。</p>
       <div id="createRow" class="hidden">
-        <div class="row"><button id="cancelAdd" class="action back-btn" title="返回" aria-label="返回">←</button><input id="newName" class="name" maxlength="80" placeholder="例如：AI 编程"></div>
-        <div class="row"><span id="createGoalLabel" class="field-label">每日目标</span><input id="dailyTarget" class="goal-input" type="number" min="0" max="24" step=".5" value="8"><span id="createGoalUnit" class="field-label">小时</span><button id="add" class="action primary">添加</button></div>
+        <div class="row create-name-row"><button id="cancelAdd" class="action back-btn" title="返回" aria-label="返回">←</button><input id="newName" class="name" maxlength="80" placeholder="例如：AI 编程"></div>
+        <div class="row create-goal-row"><span id="createGoalLabel" class="field-label">每日目标</span><input id="dailyTarget" class="goal-input" type="number" min="0" max="24" step=".5" value="8"><span id="createGoalUnit" class="field-label">小时</span><button id="add" class="action primary">添加</button></div>
       </div>
-      <div id="pickRow" class="row hidden"><select id="activity"></select><button id="newActivity" class="action icon-action" title="添加事项">＋</button><button id="deleteActivity" class="action icon-action danger" title="删除事项">×</button><select id="mode"><option value="pomodoro">番茄钟</option><option value="stopwatch">正计时</option></select></div>
-      <div id="goalRow" class="row hidden"><span id="goalLabel" class="field-label">目标</span><input id="goalHours" class="goal-input" type="number" min="0" max="24" step=".5"><span id="goalUnit" class="field-label">小时 / 天</span></div>
-      <div id="durationRow" class="row hidden"><input id="minutes" class="minutes" type="number" min="1" max="480" value="25"><span id="minutesUnit" class="hint" style="align-self:center;margin:0">分钟</span></div>
+      <div id="pickRow" class="row pick-row hidden"><select id="activity"></select><button id="newActivity" class="action icon-action" title="添加事项">＋</button><button id="deleteActivity" class="action icon-action danger" title="删除事项">×</button><select id="mode"><option value="pomodoro">番茄钟</option><option value="stopwatch">正计时</option></select></div>
+      <div id="settingsRow" class="row settings-row hidden"><span id="goalLabel" class="field-label">目标</span><input id="goalHours" class="goal-input" type="number" min="0" max="24" step=".5"><span id="goalUnit" class="field-label">小时 / 天</span><span id="durationGroup" class="duration-group"><input id="minutes" class="minutes" type="number" min="1" max="480" value="25"><span id="minutesUnit" class="field-label">分钟</span></span></div>
       <div class="actions"><button id="start" class="action primary hidden">开始</button><button id="pause" class="action primary hidden">暂停</button><button id="resume" class="action primary hidden">继续</button><button id="finish" class="action hidden">结束</button></div>
     </section>
   </main>

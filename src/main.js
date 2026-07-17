@@ -1897,6 +1897,7 @@ function getFocusSnapshot() {
     stats: summarizeFocus(_focusDataSnapshot),
     notice: focusNotice,
     lang: lang || "zh",
+    uiStyle: _settingsController.get("focusHudStyle") || "pixel",
   };
 }
 focusHud = createFocusHud({
@@ -1907,6 +1908,7 @@ focusHud = createFocusHud({
     "add-activity": (payload) => focusModuleRuntime.addActivity(payload),
     "archive-activity": (payload) => focusModuleRuntime.archiveActivity(payload),
     "update-activity": (payload) => focusModuleRuntime.updateActivity(payload),
+    "set-style": (payload) => _settingsController.applyUpdate("focusHudStyle", payload.style),
     start: (payload) => { focusNotice = null; return focusModuleRuntime.start(payload); },
     pause: () => focusModuleRuntime.pause(),
     resume: () => focusModuleRuntime.resume(),
@@ -1925,7 +1927,16 @@ focusModuleRuntime.on("change", (snapshot) => {
     focusNotice = { type: "goal", activityName: achieved.activity.name, todayMs: achieved.todayMs };
     if (!doNotDisturb) _state.setState("attention");
   }
-  if (focusHud) focusHud.broadcast({ ...snapshot, stats, notice: focusNotice });
+  // Runtime ticks intentionally contain timer data only. Always enrich them
+  // from the application-level snapshot so language and HUD skin cannot be
+  // lost when starting, pausing, resuming, or completing a phase.
+  if (focusHud) focusHud.broadcast({
+    ...snapshot,
+    stats,
+    notice: focusNotice,
+    lang: lang || "zh",
+    uiStyle: _settingsController.get("focusHudStyle") || "pixel",
+  });
   const active = snapshot && snapshot.active;
   if (!active || active.status !== "running") {
     if (!doNotDisturb) _state.setState(_state.resolveDisplayState());
@@ -1971,6 +1982,9 @@ function checkFocusReminders() {
 focusReminderTimer = setInterval(checkFocusReminders, 60_000);
 if (focusReminderTimer && typeof focusReminderTimer.unref === "function") focusReminderTimer.unref();
 _settingsController.subscribeKey("lang", () => {
+  if (focusHud) focusHud.broadcast(getFocusSnapshot());
+});
+_settingsController.subscribeKey("focusHudStyle", () => {
   if (focusHud) focusHud.broadcast(getFocusSnapshot());
 });
 

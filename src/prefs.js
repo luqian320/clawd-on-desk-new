@@ -140,6 +140,7 @@ const SCHEMA = {
   sessionHudShowContextUsage: { type: "boolean", default: true },
   sessionHudCleanupDetached: { type: "boolean", default: true },
   sessionHudPinned: { type: "boolean", default: false },
+  focusHudStyle: { type: "string", default: "pixel", enum: ["modern", "pixel"] },
   // Stale-cleanup intervals (ms). Defaults match the historical constants in
   // state-stale-cleanup.js so upgrading users see no behavioral change.
   // sessionStaleMs = 0 means "never drop a session by idle age".

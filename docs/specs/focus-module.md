@@ -155,3 +155,6 @@ appear on first launch of a new week; full detail belongs in Dashboard.
 - Added editing of the daily goal for existing activities.
 - Simplified goal editing after visual QA: compact back icon, visible goal input, and autosave without a Save button.
 - Localized the full Focus HUD in Chinese and English; it follows the app language and currently defaults to Chinese on the user's setup.
+- Added a persisted Modern / Pixel HUD style choice without changing pet themes or agent state logic. Pixel is the default; both styles share a compact aligned grid so the primary action remains visible.
+- The HUD style is application-level focus-module state: activity creation, idle, running, paused, break, and completion views must all retain the selected skin across runtime ticks.
+- Collapsed HUD bounds reserve two complete text rows plus each skin's transparent edge/shadow area; Modern and Pixel must never clip the subtitle.
