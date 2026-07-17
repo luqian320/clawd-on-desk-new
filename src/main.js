@@ -126,6 +126,11 @@ const createThemeRuntime = require("./theme-runtime");
 const createAgentRuntimeMain = require("./agent-runtime-main");
 const createFloatingWindowRuntime = require("./floating-window-runtime");
 const createPetWindowRuntime = require("./pet-window-runtime");
+const focusData = require("./focus-data");
+const { createFocusRuntime } = require("./focus-runtime");
+const { createFocusHud } = require("./focus-hud");
+const { summarize: summarizeFocus } = require("./focus-stats");
+const { findNewGoal, findDueReminder } = require("./focus-goals");
 const createMacHideController = require("./mac-hide");
 const {
   getFocusableLocalHudSessionIds: selectFocusableLocalHudSessionIds,
@@ -306,6 +311,10 @@ let themeRuntime = null;
 let agentRuntime = null;
 let systemWakeRecovery = null;
 let floatingWindowRuntime = null;
+let focusModuleRuntime = null;
+let focusHud = null;
+let focusReminderTimer = null;
+let focusNotice = null;
 let codexPetMain = null;
 let telegramApprovalSidecar = null;
 let telegramApprovalSyncPromise = Promise.resolve();
@@ -1424,6 +1433,8 @@ floatingWindowRuntime = createFloatingWindowRuntime({
   syncUpdateBubbleVisibility: () => syncUpdateBubbleVisibility(),
   hideUpdateBubble: () => hideUpdateBubble(),
   keepOutOfTaskbar,
+  repositionFocusHud: () => focusHud && focusHud.reposition(),
+  syncFocusHudVisibility: () => focusHud && focusHud.syncVisibility(),
 });
 
 function repositionFloatingBubbles() {
@@ -1867,6 +1878,95 @@ broadcastSessionHudSnapshot = _sessionHud.broadcastSessionSnapshot;
 sendSessionHudI18n = _sessionHud.sendI18n;
 getSessionHudReservedOffset = _sessionHud.getHudReservedOffset;
 getSessionHudWindow = _sessionHud.getWindow;
+
+// ── Focus module ──
+// Activity history is intentionally separate from prefs: prefs remain the
+// settings controller's domain, while this append-oriented data owns its own
+// validation and atomic persistence.
+const FOCUS_DATA_PATH = path.join(app.getPath("userData"), "focus-data.json");
+let _focusDataSnapshot = focusData.load(FOCUS_DATA_PATH);
+focusModuleRuntime = createFocusRuntime({
+  data: _focusDataSnapshot,
+  persist: (next) => {
+    _focusDataSnapshot = focusData.save(FOCUS_DATA_PATH, next);
+  },
+});
+function getFocusSnapshot() {
+  return {
+    ...focusModuleRuntime.snapshot(),
+    stats: summarizeFocus(_focusDataSnapshot),
+    notice: focusNotice,
+  };
+}
+focusHud = createFocusHud({
+  getPetWindowBounds,
+  getPetHidden: () => petWindowRuntime.isPetHidden(),
+  getSnapshot: () => getFocusSnapshot(),
+  actions: {
+    "add-activity": (payload) => focusModuleRuntime.addActivity(payload),
+    start: (payload) => { focusNotice = null; return focusModuleRuntime.start(payload); },
+    pause: () => focusModuleRuntime.pause(),
+    resume: () => focusModuleRuntime.resume(),
+    finish: () => focusModuleRuntime.finish(),
+    "update-config": (payload) => focusModuleRuntime.updateConfig(payload),
+  },
+  onExpandedChange: () => repositionAnchoredFloatingSurfaces(),
+});
+
+focusModuleRuntime.on("change", (snapshot) => {
+  const stats = summarizeFocus(_focusDataSnapshot);
+  const achieved = findNewGoal(_focusDataSnapshot, stats);
+  if (achieved) {
+    _focusDataSnapshot.celebrations[achieved.key] = true;
+    _focusDataSnapshot = focusData.save(FOCUS_DATA_PATH, _focusDataSnapshot);
+    focusNotice = { type: "goal", activityName: achieved.activity.name, todayMs: achieved.todayMs };
+    if (!doNotDisturb) _state.setState("attention");
+  }
+  if (focusHud) focusHud.broadcast({ ...snapshot, stats, notice: focusNotice });
+  const active = snapshot && snapshot.active;
+  if (!active || active.status !== "running") {
+    if (!doNotDisturb) _state.setState(_state.resolveDisplayState());
+    return;
+  }
+  if (doNotDisturb) return;
+  const agentSnapshot = _state.buildSessionSnapshot();
+  const hasAgentPriority = Array.isArray(agentSnapshot.sessions)
+    && agentSnapshot.sessions.some((session) => session && !session.headless
+      && (session.state === "working" || session.state === "thinking"
+        || session.state === "juggling" || session.state === "notification"
+        || session.state === "error"));
+  if (hasAgentPriority) return;
+  if (active.status === "running") {
+    _state.setState(active.phase === "focus" ? "working" : (active.phase === "long-break" ? "sleeping" : "dozing"));
+  }
+});
+focusModuleRuntime.on("phase-complete", () => {
+  if (!doNotDisturb) _state.setState("notification");
+});
+
+function checkFocusReminders() {
+  if (!focusModuleRuntime || !focusHud) return;
+  const runtimeSnapshot = focusModuleRuntime.snapshot();
+  const stats = summarizeFocus(_focusDataSnapshot);
+  const reminder = findDueReminder(_focusDataSnapshot, stats, {
+    now: Date.now(),
+    active: !!runtimeSnapshot.active,
+    doNotDisturb,
+  });
+  if (!reminder) return;
+  _focusDataSnapshot.reminderLastShown[reminder.key] = Date.now();
+  _focusDataSnapshot = focusData.save(FOCUS_DATA_PATH, _focusDataSnapshot);
+  focusNotice = {
+    type: "reminder",
+    activityName: reminder.activity.name,
+    remainingMs: reminder.remainingMs,
+  };
+  focusHud.broadcast(getFocusSnapshot());
+  focusHud.showExpanded();
+  _state.setState("notification");
+}
+focusReminderTimer = setInterval(checkFocusReminders, 60_000);
+if (focusReminderTimer && typeof focusReminderTimer.unref === "function") focusReminderTimer.unref();
 
 agentRuntime = createAgentRuntimeMain({
   getServer: () => _server,
@@ -3082,6 +3182,7 @@ const _menuCtx = {
   getActiveThemeCapabilities: () => themeRuntime.getActiveThemeCapabilities(),
   ensureUserThemesDir: () => themeLoader.ensureUserThemesDir(),
   openSettingsWindow: () => settingsWindowRuntime.open(),
+  openFocusHud: () => focusHud && focusHud.showExpanded(),
   showTutorial: () => _tutorial.open(),
 };
 const _menu = require("./menu")(_menuCtx);
@@ -3480,6 +3581,8 @@ function createWindow() {
       petWindowRuntime.reloadWindowWebContents(ownedHitWin, { crashKey: "hitWin", details });
     },
   });
+
+  focusHud.create();
 
   // Event-level safety net for position sync
   win.on("move", () => petWindowRuntime.syncFloatingWindowsAfterPetBoundsChange());
@@ -4014,6 +4117,9 @@ if (!gotTheLock) {
     _mini.cleanup();
     if (macHideController) macHideController.stop();
     _sessionHud.cleanup();
+    if (focusHud) focusHud.cleanup();
+    if (focusModuleRuntime) focusModuleRuntime.dispose();
+    if (focusReminderTimer) clearInterval(focusReminderTimer);
     agentRuntime.cleanup();
     topmostRuntime.cleanup();
     themeRuntime.cleanup();

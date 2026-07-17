@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Focus</title>
+  <style>
+    :root { color-scheme: light dark; --tomato: #e85d3f; --ink: #27231f; --muted: #756d64; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+    body { padding: 3px 4px 7px; font: 12px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); user-select: none; }
+    button, input, select { font: inherit; }
+    .card { position: relative; overflow: hidden; width: 100%; height: 100%; border: 1px solid rgba(82,67,53,.2); border-radius: 10px; background: rgba(255,252,247,.94); box-shadow: 0 5px 16px rgba(51,36,24,.16); backdrop-filter: blur(12px); }
+    .rail { position: absolute; inset: 0 auto auto 0; height: 3px; width: calc(var(--progress, 1) * 100%); background: var(--tomato); transition: width .3s linear; }
+    .summary { height: 34px; width: 100%; display: flex; align-items: center; gap: 8px; padding: 4px 9px 2px; border: 0; color: inherit; background: transparent; cursor: pointer; text-align: left; }
+    .tomato { width: 17px; height: 17px; border-radius: 50% 48% 52% 45%; background: var(--tomato); box-shadow: inset -2px -2px rgba(115,33,19,.18); position: relative; flex: 0 0 auto; }
+    .tomato::before { content: ""; position: absolute; width: 7px; height: 4px; left: 5px; top: -2px; background: #477b4b; clip-path: polygon(50% 100%,0 0,45% 35%,100% 0); }
+    .copy { min-width: 0; flex: 1; }
+    .label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+    .sub { color: var(--muted); font-size: 10px; }
+    .time { font: 650 15px/1 ui-monospace, "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; letter-spacing: -.3px; }
+    .chev { color: var(--muted); transform: rotate(0); transition: transform .12s ease; }
+    .expanded .chev { transform: rotate(180deg); }
+    .panel { display: none; border-top: 1px solid rgba(82,67,53,.12); padding: 8px; }
+    .expanded .panel { display: block; }
+    .row { display: flex; gap: 6px; margin-bottom: 7px; }
+    input, select { min-width: 0; height: 27px; border: 1px solid rgba(82,67,53,.22); border-radius: 6px; padding: 0 7px; color: inherit; background: rgba(255,255,255,.55); outline: none; }
+    select, .name { flex: 1; }
+    .minutes { width: 58px; }
+    input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid rgba(232,93,63,.7); outline-offset: 1px; }
+    .actions { display: flex; gap: 6px; }
+    .action { height: 29px; border: 0; border-radius: 7px; padding: 0 10px; cursor: pointer; font-weight: 650; background: rgba(76,67,59,.1); color: inherit; }
+    .action.primary { flex: 1; color: white; background: var(--tomato); }
+    .action:hover { filter: brightness(.96); }
+    .hint { margin: 0 0 6px; color: var(--muted); font-size: 10px; }
+    .hidden { display: none !important; }
+    @media (prefers-color-scheme: dark) {
+      :root { --ink: #f5eee7; --muted: #b9aea4; }
+      .card { background: rgba(35,31,28,.94); border-color: rgba(255,255,255,.14); box-shadow: 0 5px 18px rgba(0,0,0,.35); }
+      input, select { background: rgba(255,255,255,.08); border-color: rgba(255,255,255,.15); }
+      .panel { border-color: rgba(255,255,255,.1); }
+    }
+    @media (prefers-reduced-motion: reduce) { .rail, .chev { transition: none; } }
+  </style>
+</head>
+<body>
+  <main id="card" class="card">
+    <div id="rail" class="rail"></div>
+    <button id="summary" class="summary" aria-expanded="false">
+      <span class="tomato" aria-hidden="true"></span>
+      <span class="copy"><span id="label" class="label">Start focus</span><span id="sub" class="sub">25 min Pomodoro</span></span>
+      <span id="time" class="time hidden">25:00</span><span class="chev">⌄</span>
+    </button>
+    <section class="panel">
+      <p id="hint" class="hint">Choose what you want to make time for.</p>
+      <div id="createRow" class="row"><input id="newName" class="name" maxlength="80" placeholder="e.g. AI programming"><input id="dailyTarget" class="minutes" type="number" min="0" max="24" step=".5" value="8" title="Daily target hours"><button id="add" class="action">Add</button></div>
+      <div id="pickRow" class="row hidden"><select id="activity"></select><button id="newActivity" class="action" title="Add activity">＋</button><select id="mode"><option value="pomodoro">Pomodoro</option><option value="stopwatch">Stopwatch</option></select></div>
+      <div id="durationRow" class="row hidden"><input id="minutes" class="minutes" type="number" min="1" max="480" value="25"><span class="hint" style="align-self:center;margin:0">minutes</span></div>
+      <div class="actions"><button id="start" class="action primary hidden">Start</button><button id="pause" class="action primary hidden">Pause</button><button id="resume" class="action primary hidden">Resume</button><button id="finish" class="action hidden">Finish</button></div>
+    </section>
+  </main>
+  <script src="focus-hud-renderer.js"></script>
+</body>
+</html>

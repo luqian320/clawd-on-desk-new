@@ -198,6 +198,12 @@ module.exports = function initMenu(ctx) {
     // context menu).
     const workGroup = [
       {
+        label: t("focus"),
+        click: () => {
+          if (typeof ctx.openFocusHud === "function") ctx.openFocusHud();
+        },
+      },
+      {
         label: t("openDashboard"),
         click: () => {
           if (typeof ctx.openDashboard === "function") ctx.openDashboard();
@@ -410,6 +416,12 @@ module.exports = function initMenu(ctx) {
     ];
 
     const workGroup = [
+      {
+        label: t("focus"),
+        click: () => {
+          if (typeof ctx.openFocusHud === "function") ctx.openFocusHud();
+        },
+      },
       {
         label: t("openDashboard"),
         click: () => {

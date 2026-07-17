@@ -20,6 +20,8 @@ function createFloatingWindowRuntime(options = {}) {
   const syncSessionHudVisibility = options.syncSessionHudVisibility || noop;
   const syncUpdateBubbleVisibility = options.syncUpdateBubbleVisibility || noop;
   const hideUpdateBubble = options.hideUpdateBubble || noop;
+  const repositionFocusHud = options.repositionFocusHud || noop;
+  const syncFocusHudVisibility = options.syncFocusHudVisibility || noop;
 
   function repositionFloatingBubbles() {
     if (getPendingList(getPendingPermissions).length) repositionPermissionBubbles();
@@ -28,6 +30,7 @@ function createFloatingWindowRuntime(options = {}) {
 
   function repositionAnchoredSurfaces() {
     repositionSessionHud();
+    repositionFocusHud();
     repositionFloatingBubbles();
   }
 
@@ -45,6 +48,7 @@ function createFloatingWindowRuntime(options = {}) {
       }
     }
     syncUpdateBubbleVisibility();
+    syncFocusHudVisibility();
   }
 
   function hideFloatingSurfacesForPet() {
@@ -55,6 +59,7 @@ function createFloatingWindowRuntime(options = {}) {
       }
     }
     hideUpdateBubble();
+    syncFocusHudVisibility();
   }
 
   return {
