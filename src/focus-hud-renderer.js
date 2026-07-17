@@ -8,6 +8,48 @@ let addPrompt = "";
 let goalSaveTimer = null;
 const $ = (id) => document.getElementById(id);
 
+const COPY = {
+  zh: {
+    startFocus: "开始专注", pomodoro: "番茄钟", stopwatch: "正计时", paused: "已暂停",
+    shortBreak: "短休息", longBreak: "长休息", choose: "选择你想投入时间的事情。",
+    today: "今天", week: "本周", total: "累计", minPomodoro: "{n} 分钟番茄钟",
+    goalDone: "今日目标完成，真棒！", continue: "继续 {name}", leftToday: "今天还差 {n} 小时",
+    added: "已添加“{name}”，现在开始吗？", deleteConfirm: "删除“{name}”吗？历史记录会保留。",
+    dailyGoal: "每日目标", goal: "目标", hours: "小时", hoursPerDay: "小时 / 天", minutes: "分钟",
+    add: "添加", start: "开始", pause: "暂停", resume: "继续", finish: "结束", back: "返回",
+    addActivity: "添加事项", deleteActivity: "删除事项", namePlaceholder: "例如：AI 编程",
+  },
+  en: {
+    startFocus: "Start focus", pomodoro: "Pomodoro", stopwatch: "Stopwatch", paused: "Paused",
+    shortBreak: "Short break", longBreak: "Long break", choose: "Choose what you want to make time for.",
+    today: "Today", week: "Week", total: "Total", minPomodoro: "{n} min Pomodoro",
+    goalDone: "Goal complete — great work!", continue: "Continue {name}", leftToday: "{n}h left today",
+    added: "Added “{name}”. Start it now?", deleteConfirm: "Delete “{name}”? Its history will be kept.",
+    dailyGoal: "Daily goal", goal: "Goal", hours: "hours", hoursPerDay: "h / day", minutes: "minutes",
+    add: "Add", start: "Start", pause: "Pause", resume: "Resume", finish: "Finish", back: "Back",
+    addActivity: "Add activity", deleteActivity: "Delete activity", namePlaceholder: "e.g. AI programming",
+  },
+};
+
+function locale() { return snapshot.lang === "en" ? "en" : "zh"; }
+function t(key, vars = {}) {
+  let value = COPY[locale()][key] || COPY.zh[key] || key;
+  for (const [name, replacement] of Object.entries(vars)) value = value.replace(`{${name}}`, replacement);
+  return value;
+}
+function applyLanguage() {
+  document.documentElement.lang = locale() === "zh" ? "zh-CN" : "en";
+  $("cancelAdd").title = t("back"); $("cancelAdd").setAttribute("aria-label", t("back"));
+  $("newName").placeholder = t("namePlaceholder");
+  $("createGoalLabel").textContent = t("dailyGoal"); $("createGoalUnit").textContent = t("hours");
+  $("goalLabel").textContent = t("goal"); $("goalUnit").textContent = t("hoursPerDay");
+  $("minutesUnit").textContent = t("minutes"); $("add").textContent = t("add");
+  $("start").textContent = t("start"); $("pause").textContent = t("pause");
+  $("resume").textContent = t("resume"); $("finish").textContent = t("finish");
+  $("newActivity").title = t("addActivity"); $("deleteActivity").title = t("deleteActivity");
+  $("mode").options[0].textContent = t("pomodoro"); $("mode").options[1].textContent = t("stopwatch");
+}
+
 function show(id, visible) { $(id).classList.toggle("hidden", !visible); }
 function format(ms, countdown = false) {
   const seconds = Math.max(0, countdown ? Math.ceil(ms / 1000) : Math.floor(ms / 1000));
@@ -22,11 +64,13 @@ function compactDuration(ms) {
   const minutes = Math.floor(Math.max(0, ms || 0) / 60000);
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
+  if (locale() === "zh") return hours ? `${hours}小时${rest}分钟` : `${rest}分钟`;
   return hours ? `${hours}h ${rest}m` : `${rest}m`;
 }
 
 function render(next) {
   snapshot = next || snapshot;
+  applyLanguage();
   const active = snapshot.active;
   const hasActivities = snapshot.activities.some((item) => !item.archivedAt);
   const selectedId = active ? active.activityId : (selectedActivityId || $("activity").value);
@@ -51,9 +95,9 @@ function render(next) {
     $("hint").textContent = addPrompt;
   } else if (stats) {
     const target = stats.activity.dailyTargetMs > 0 ? ` / ${compactDuration(stats.activity.dailyTargetMs)}` : "";
-    $("hint").textContent = `Today ${compactDuration(stats.todayMs)}${target} · Week ${compactDuration(stats.weekMs)} · Total ${compactDuration(stats.allTimeMs)}`;
+    $("hint").textContent = `${t("today")} ${compactDuration(stats.todayMs)}${target} · ${t("week")} ${compactDuration(stats.weekMs)} · ${t("total")} ${compactDuration(stats.allTimeMs)}`;
   } else {
-    $("hint").textContent = "Choose what you want to make time for.";
+    $("hint").textContent = t("choose");
   }
   show("createRow", (!hasActivities || creatingActivity) && !active);
   show("pickRow", hasActivities && !active && !creatingActivity);
@@ -65,22 +109,22 @@ function render(next) {
   show("finish", !!active);
   show("time", !!active);
   if (!active) {
-    $("label").textContent = "Start focus";
+    $("label").textContent = t("startFocus");
     if (snapshot.notice && snapshot.notice.type === "goal") {
-      $("label").textContent = "Goal complete — great work!";
+      $("label").textContent = t("goalDone");
       $("sub").textContent = snapshot.notice.activityName;
     } else if (snapshot.notice && snapshot.notice.type === "reminder") {
-      $("label").textContent = `Continue ${snapshot.notice.activityName}`;
-      $("sub").textContent = `${Math.ceil(snapshot.notice.remainingMs / 3600000 * 10) / 10}h left today`;
+      $("label").textContent = t("continue", { name: snapshot.notice.activityName });
+      $("sub").textContent = t("leftToday", { n: Math.ceil(snapshot.notice.remainingMs / 3600000 * 10) / 10 });
     } else {
-      $("sub").textContent = `${Math.round((snapshot.config.focusMs || 1500000) / 60000)} min Pomodoro`;
+      $("sub").textContent = t("minPomodoro", { n: Math.round((snapshot.config.focusMs || 1500000) / 60000) });
     }
     $("rail").style.setProperty("--progress", 1);
     return;
   }
-  const phaseLabel = active.phase === "focus" ? active.activity.name : (active.phase === "long-break" ? "Long break" : "Short break");
+  const phaseLabel = active.phase === "focus" ? active.activity.name : (active.phase === "long-break" ? t("longBreak") : t("shortBreak"));
   $("label").textContent = phaseLabel;
-  $("sub").textContent = active.status === "paused" ? "Paused" : (active.mode === "pomodoro" ? "Pomodoro" : "Stopwatch");
+  $("sub").textContent = active.status === "paused" ? t("paused") : (active.mode === "pomodoro" ? t("pomodoro") : t("stopwatch"));
   $("time").textContent = format(active.mode === "pomodoro" ? active.remainingMs : active.elapsedMs, active.mode === "pomodoro");
   const progress = active.mode === "pomodoro" ? active.remainingMs / active.phaseDurationMs : 1;
   $("rail").style.setProperty("--progress", Math.max(0, Math.min(1, progress)));
@@ -101,14 +145,14 @@ $("add").addEventListener("click", async () => {
   const result = await window.focusHudAPI.addActivity({ name, dailyTargetMs: Number($("dailyTarget").value) * 3600000, remindersEnabled: true });
   if (!result || result.status !== "ok") return;
   selectedActivityId = result.activity.id;
-  addPrompt = `Added “${result.activity.name}”. Start it now?`;
+  addPrompt = t("added", { name: result.activity.name });
   $("newName").value = ""; creatingActivity = false;
   render(await window.focusHudAPI.getSnapshot());
 });
 $("deleteActivity").addEventListener("click", async () => {
   const activityId = $("activity").value;
   const activity = snapshot.activities.find((item) => item.id === activityId);
-  if (!activity || !window.confirm(`Delete “${activity.name}”? Its history will be kept.`)) return;
+  if (!activity || !window.confirm(t("deleteConfirm", { name: activity.name }))) return;
   const result = await window.focusHudAPI.archiveActivity({ activityId });
   if (!result || result.status !== "ok") return;
   selectedActivityId = ""; addPrompt = "";

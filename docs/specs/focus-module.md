@@ -154,3 +154,4 @@ appear on first launch of a new week; full detail belongs in Dashboard.
 - Added Cancel while creating an activity and made “Daily goal (hours)” explicit.
 - Added editing of the daily goal for existing activities.
 - Simplified goal editing after visual QA: compact back icon, visible goal input, and autosave without a Save button.
+- Localized the full Focus HUD in Chinese and English; it follows the app language and currently defaults to Chinese on the user's setup.

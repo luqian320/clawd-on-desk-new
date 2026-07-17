@@ -1896,6 +1896,7 @@ function getFocusSnapshot() {
     ...focusModuleRuntime.snapshot(),
     stats: summarizeFocus(_focusDataSnapshot),
     notice: focusNotice,
+    lang: lang || "zh",
   };
 }
 focusHud = createFocusHud({
@@ -1969,6 +1970,9 @@ function checkFocusReminders() {
 }
 focusReminderTimer = setInterval(checkFocusReminders, 60_000);
 if (focusReminderTimer && typeof focusReminderTimer.unref === "function") focusReminderTimer.unref();
+_settingsController.subscribeKey("lang", () => {
+  if (focusHud) focusHud.broadcast(getFocusSnapshot());
+});
 
 agentRuntime = createAgentRuntimeMain({
   getServer: () => _server,

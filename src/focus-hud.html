@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -53,19 +53,19 @@
     <div id="rail" class="rail"></div>
     <button id="summary" class="summary" aria-expanded="false">
       <span class="tomato" aria-hidden="true"></span>
-      <span class="copy"><span id="label" class="label">Start focus</span><span id="sub" class="sub">25 min Pomodoro</span></span>
+      <span class="copy"><span id="label" class="label">开始专注</span><span id="sub" class="sub">25 分钟番茄钟</span></span>
       <span id="time" class="time hidden">25:00</span><span class="chev">⌄</span>
     </button>
     <section class="panel">
-      <p id="hint" class="hint">Choose what you want to make time for.</p>
+      <p id="hint" class="hint">选择你想投入时间的事情。</p>
       <div id="createRow" class="hidden">
-        <div class="row"><button id="cancelAdd" class="action back-btn" title="Back" aria-label="Back">←</button><input id="newName" class="name" maxlength="80" placeholder="e.g. AI programming"></div>
-        <div class="row"><span class="field-label">Daily goal</span><input id="dailyTarget" class="goal-input" type="number" min="0" max="24" step=".5" value="8"><span class="field-label">hours</span><button id="add" class="action primary">Add</button></div>
+        <div class="row"><button id="cancelAdd" class="action back-btn" title="返回" aria-label="返回">←</button><input id="newName" class="name" maxlength="80" placeholder="例如：AI 编程"></div>
+        <div class="row"><span id="createGoalLabel" class="field-label">每日目标</span><input id="dailyTarget" class="goal-input" type="number" min="0" max="24" step=".5" value="8"><span id="createGoalUnit" class="field-label">小时</span><button id="add" class="action primary">添加</button></div>
       </div>
-      <div id="pickRow" class="row hidden"><select id="activity"></select><button id="newActivity" class="action icon-action" title="Add activity">＋</button><button id="deleteActivity" class="action icon-action danger" title="Delete activity">×</button><select id="mode"><option value="pomodoro">Pomodoro</option><option value="stopwatch">Stopwatch</option></select></div>
-      <div id="goalRow" class="row hidden"><span class="field-label">Goal</span><input id="goalHours" class="goal-input" type="number" min="0" max="24" step=".5"><span class="field-label">h / day</span></div>
-      <div id="durationRow" class="row hidden"><input id="minutes" class="minutes" type="number" min="1" max="480" value="25"><span class="hint" style="align-self:center;margin:0">minutes</span></div>
-      <div class="actions"><button id="start" class="action primary hidden">Start</button><button id="pause" class="action primary hidden">Pause</button><button id="resume" class="action primary hidden">Resume</button><button id="finish" class="action hidden">Finish</button></div>
+      <div id="pickRow" class="row hidden"><select id="activity"></select><button id="newActivity" class="action icon-action" title="添加事项">＋</button><button id="deleteActivity" class="action icon-action danger" title="删除事项">×</button><select id="mode"><option value="pomodoro">番茄钟</option><option value="stopwatch">正计时</option></select></div>
+      <div id="goalRow" class="row hidden"><span id="goalLabel" class="field-label">目标</span><input id="goalHours" class="goal-input" type="number" min="0" max="24" step=".5"><span id="goalUnit" class="field-label">小时 / 天</span></div>
+      <div id="durationRow" class="row hidden"><input id="minutes" class="minutes" type="number" min="1" max="480" value="25"><span id="minutesUnit" class="hint" style="align-self:center;margin:0">分钟</span></div>
+      <div class="actions"><button id="start" class="action primary hidden">开始</button><button id="pause" class="action primary hidden">暂停</button><button id="resume" class="action primary hidden">继续</button><button id="finish" class="action hidden">结束</button></div>
     </section>
   </main>
   <script src="focus-hud-renderer.js"></script>
