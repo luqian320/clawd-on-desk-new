@@ -2025,7 +2025,7 @@ function showCodexNotifyBubble({ sessionId, command, sticky = false }) {
   const policy = getPolicy(ctx, "notification");
   const existing = findCodexNotifyEntryBySession(sessionId);
   if (existing) {
-    existing.toolInput = { command: command || "(unknown)" };
+    existing.toolInput = { command: command || "" };
     existing.createdAt = Date.now();
     existing.stickyPassiveNotify = sticky === true;
     permLog(`passive notify refresh: agent=codex session=${sessionId} autoCloseMs=${policy.autoCloseMs}`);
@@ -2038,7 +2038,7 @@ function showCodexNotifyBubble({ sessionId, command, sticky = false }) {
     abortHandler: null, suggestions: [],
     sessionId, bubble: null, hideTimer: null,
     toolName: "CodexExec",
-    toolInput: { command: command || "(unknown)" },
+    toolInput: { command: command || "" },
     resolvedSuggestion: null, createdAt: Date.now(),
     isElicitation: false, isCodexNotify: true,
     agentId: "codex",

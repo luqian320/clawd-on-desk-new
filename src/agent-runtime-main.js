@@ -178,7 +178,7 @@ function createAgentRuntimeMain(options = {}) {
           }));
           showCodexNotifyBubble({
             sessionId: sid,
-            command: "",
+            command: extra.desktopApprovalReason || "",
             sticky: true,
           });
           return;

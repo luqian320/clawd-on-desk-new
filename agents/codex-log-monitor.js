@@ -27,6 +27,24 @@ const {
 const DESKTOP_APPROVAL_EVENT = "response_item:desktop_approval_requested";
 const DESKTOP_APPROVAL_RESOLVED_EVENT = "response_item:desktop_approval_resolved";
 
+function extractApprovalReason(input) {
+  const source = typeof input === "string" ? input : "";
+  const doubleQuoted = /["']?justification["']?\s*:\s*"((?:\\.|[^"\\])*)"/.exec(source);
+  if (doubleQuoted) {
+    try {
+      return JSON.parse(`"${doubleQuoted[1]}"`).replace(/\s+/g, " ").trim().slice(0, 240);
+    } catch {}
+  }
+  const singleQuoted = /["']?justification["']?\s*:\s*'((?:\\.|[^'\\])*)'/.exec(source);
+  if (!singleQuoted) return "";
+  return singleQuoted[1]
+    .replace(/\\'/g, "'")
+    .replace(/\\\\/g, "\\")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
 function detectCodexDesktopApprovalRequest(obj, tracked) {
   if (!obj || obj.type !== "response_item") return null;
   const payload = obj.payload && typeof obj.payload === "object" ? obj.payload : null;
@@ -35,7 +53,7 @@ function detectCodexDesktopApprovalRequest(obj, tracked) {
   const input = typeof payload.input === "string" ? payload.input : "";
   if (!/["']?sandbox_permissions["']?\s*:\s*["']require_escalated["']/.test(input)) return null;
   const callId = typeof payload.call_id === "string" && payload.call_id ? payload.call_id : null;
-  return callId ? { callId } : null;
+  return callId ? { callId, reason: extractApprovalReason(input) } : null;
 }
 
 function getCustomToolOutputCallId(obj) {
@@ -457,6 +475,7 @@ class CodexLogMonitor {
         this._emitStateChange(tracked, "notification", DESKTOP_APPROVAL_EVENT, {
           desktopApprovalRequested: true,
           desktopApprovalCallId: desktopApproval.callId,
+          desktopApprovalReason: desktopApproval.reason,
         });
       }
       return;
@@ -759,5 +778,6 @@ module.exports.__test = {
   DESKTOP_APPROVAL_EVENT,
   DESKTOP_APPROVAL_RESOLVED_EVENT,
   detectCodexDesktopApprovalRequest,
+  extractApprovalReason,
   getCustomToolOutputCallId,
 };

@@ -5,7 +5,7 @@ const path = require("path");
 const os = require("os");
 const CodexLogMonitor = require("../agents/codex-log-monitor");
 const codexConfig = require("../agents/codex");
-const { detectCodexDesktopApprovalRequest, getCustomToolOutputCallId } = CodexLogMonitor.__test;
+const { detectCodexDesktopApprovalRequest, extractApprovalReason, getCustomToolOutputCallId } = CodexLogMonitor.__test;
 
 // Helper: create a temp session dir with today's date structure
 function makeTempSessionDir() {
@@ -53,23 +53,24 @@ describe("CodexLogMonitor", () => {
         type: "custom_tool_call",
         name: "exec",
         call_id: "call-approval-1",
-        input: 'await tools.exec_command({ cmd: "npm start", sandbox_permissions: "require_escalated" })',
+        input: 'await tools.exec_command({ cmd: "npm start", sandbox_permissions: "require_escalated", justification: "允许启动调试版吗？" })',
       },
     };
     assert.deepStrictEqual(
       detectCodexDesktopApprovalRequest(approval, { codexOriginator: "Codex Desktop" }),
-      { callId: "call-approval-1" }
+      { callId: "call-approval-1", reason: "允许启动调试版吗？" }
     );
     assert.deepStrictEqual(
       detectCodexDesktopApprovalRequest({
         ...approval,
         payload: {
           ...approval.payload,
-          input: 'await tools.exec_command({"cmd":"npm start","sandbox_permissions":"require_escalated"})',
+          input: 'await tools.exec_command({"cmd":"npm start","sandbox_permissions":"require_escalated","justification":"Push to GitHub?"})',
         },
       }, { codexOriginator: "Codex Desktop" }),
-      { callId: "call-approval-1" }
+      { callId: "call-approval-1", reason: "Push to GitHub?" }
     );
+    assert.strictEqual(extractApprovalReason("sandbox_permissions: 'require_escalated', justification: 'Open Codex \\\'now\\\''"), "Open Codex 'now'");
     assert.strictEqual(
       detectCodexDesktopApprovalRequest(approval, { codexOriginator: "codex-cli" }),
       null

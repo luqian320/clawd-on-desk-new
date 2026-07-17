@@ -271,6 +271,7 @@ describe("agent-runtime-main", () => {
       cwd: "/repo",
       codexOriginator: "Codex Desktop",
       desktopApprovalRequested: true,
+      desktopApprovalReason: "Push the focus branch to GitHub?",
     });
     monitor.emit("codex:desktop", "working", "response_item:desktop_approval_resolved", {
       cwd: "/repo",
@@ -288,7 +289,7 @@ describe("agent-runtime-main", () => {
       }],
       ["show", {
         sessionId: "codex:desktop",
-        command: "",
+        command: "Push the focus branch to GitHub?",
         sticky: true,
       }],
       ["clear", "codex:desktop", "codex-desktop-approval-resolved"],
