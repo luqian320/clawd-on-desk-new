@@ -31,12 +31,15 @@ docs/**
 !docs/guides/state-mapping.md
 !docs/guides/state-mapping.zh-CN.md
 !docs/guides/telegram-approval.md
+!docs/guides/feishu-lark-remote-approval.md
 !docs/guides/codex-wsl-clarification.md
 !docs/guides/codex-wsl-clarification.zh-CN.md
 !docs/guides/codex-wsl-clarification.ko-KR.md
 !docs/investigations/
 !docs/investigations/permission-hook-fail-deny-investigation.md
 !docs/investigations/codex-subagent-session-meta.md
+!docs/plans/
+!docs/plans/plan-issue-513-remote-ssh-isolation.md
 !docs/project/
 !docs/project/agent-runtime-architecture.md
 !docs/project/release-process.md
@@ -57,6 +60,8 @@ docs/**
 !docs/releases/release-v0.9.0.md
 !docs/releases/release-v0.10.0.md
 !docs/releases/release-v0.11.0.md
+!docs/releases/release-v0.12.0.md
+!docs/releases/release-v0.13.0.md
 
 # Temp files from testing
 .tmp_*
@@ -90,12 +95,6 @@ tools/check_dark.py
 # Debug logs
 logs/
 
-# Telegram approval sidecar build artifacts
-bin/cc-connect-clawd/*/cc-connect-clawd
-bin/cc-connect-clawd/*/cc-connect-clawd.exe
-!bin/cc-connect-clawd/
-!bin/cc-connect-clawd/README.md
-
 # GIF recording tools (not part of main project)
 scripts/*
 !scripts/remote-deploy.sh
@@ -105,8 +104,9 @@ scripts/*
 !scripts/validate-theme.js
 !scripts/create-theme.js
 !scripts/export-agent-icons.js
-!scripts/verify-sidecar-binaries.js
-!scripts/fetch-sidecar-binaries.js
+!scripts/verify-electron-install.js
+!scripts/audit-repository-assets.js
+!scripts/assert-no-retired-telegram-sidecar.js
 
 # oh-my-cursor state
 .omc/

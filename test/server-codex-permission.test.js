@@ -5,6 +5,12 @@ const { EventEmitter } = require("node:events");
 const { describe, it } = require("node:test");
 
 const initServer = require("../src/server");
+const { makeSessionKey } = require("../src/session-key");
+
+const localSessionKey = (rawSessionId) => makeSessionKey({
+  profileId: "local",
+  rawSessionId,
+});
 
 function makeFakeHttp() {
   let capturedHandler = null;
@@ -160,10 +166,17 @@ describe("Codex official /permission path", () => {
     assert.strictEqual(pendingPermissions.length, 1);
     assert.strictEqual(shown.length, 1);
     assert.deepStrictEqual(updates[0], [
-      "codex:s1",
+      localSessionKey("codex:s1"),
       "notification",
       "PermissionRequest",
-      { agentId: "codex", hookSource: "codex-official" },
+      {
+        agentId: "codex",
+        hookSource: "codex-official",
+        sessionAutomationIdentity: {
+          eligible: false,
+          reason: "non-authoritative-codex-session-id",
+        },
+      },
     ]);
 
     res.destroy();
@@ -193,7 +206,7 @@ describe("Codex official /permission path", () => {
     assert.strictEqual(pendingPermissions.length, 0);
     assert.strictEqual(shown.length, 0);
     assert.deepStrictEqual(updates[0], [
-      "codex:019e115a-4df2-7ed0-b90e-8e6345aca777",
+      localSessionKey("codex:019e115a-4df2-7ed0-b90e-8e6345aca777"),
       "notification",
       "PermissionRequest",
       {
@@ -206,6 +219,10 @@ describe("Codex official /permission path", () => {
         model: "gpt-5.4",
         codexOriginator: "Codex Desktop",
         codexSource: "vscode",
+        sessionAutomationIdentity: {
+          eligible: false,
+          reason: "unsupported-codex-session-source",
+        },
         transientPermissionEvent: true,
       },
     ]);
@@ -255,7 +272,7 @@ describe("Codex official /permission path", () => {
     const entry = pendingPermissions[0];
     assert.strictEqual(entry.isCodex, true);
     assert.strictEqual(entry.agentId, "codex");
-    assert.strictEqual(entry.sessionId, "codex:s1");
+    assert.strictEqual(entry.sessionId, localSessionKey("codex:s1"));
     assert.strictEqual(entry.toolName, "Bash");
     assert.deepStrictEqual(entry.suggestions, []);
     assert.strictEqual(entry.isElicitation || false, false);
@@ -263,12 +280,49 @@ describe("Codex official /permission path", () => {
     assert.strictEqual(entry.toolInput.command, "npm test");
     assert.strictEqual(entry.toolInputFingerprint, "abc123");
     assert.deepStrictEqual(updates[0], [
-      "codex:s1",
+      localSessionKey("codex:s1"),
       "notification",
       "PermissionRequest",
-      { agentId: "codex", hookSource: "codex-official" },
+      {
+        agentId: "codex",
+        hookSource: "codex-official",
+        sessionAutomationIdentity: {
+          eligible: false,
+          reason: "non-authoritative-codex-session-id",
+        },
+      },
     ]);
 
+    res.destroy();
+  });
+
+  it("marks an audited local process-bound Codex TUI permission eligible", async () => {
+    const sessionId = "codex:019f9c87-23a9-7d03-a7ac-c11e3270c3b8";
+    const { handler, pendingPermissions, updates } = startServer();
+    const req = makeReq({
+      agent_id: "codex",
+      hook_source: "codex-official",
+      session_id: sessionId,
+      tool_name: "Bash",
+      tool_input: { command: "npm test" },
+      source_pid: 778,
+      agent_pid: 777,
+      codex_originator: "codex-tui",
+      codex_source: "cli",
+    });
+    const res = makeRes();
+
+    handler(req, res);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepStrictEqual(
+      pendingPermissions[0].sessionAutomationIdentity,
+      { eligible: true, reason: "eligible" }
+    );
+    assert.deepStrictEqual(
+      updates[0][3].sessionAutomationIdentity,
+      pendingPermissions[0].sessionAutomationIdentity
+    );
     res.destroy();
   });
 

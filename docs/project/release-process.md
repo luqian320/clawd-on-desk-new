@@ -10,13 +10,13 @@ Use this flow when preparing a Clawd app release.
 
 ```bash
 npm test
-node scripts/verify-sidecar-binaries.js prebuild:all
+npm run audit:assets
 ```
 
 4. Run the `Build & Release` workflow manually on `main`.
 
-Manual workflow dispatch builds Windows, macOS, and Linux artifacts, fetches the
-pinned `cc-connect-clawd` sidecar release, verifies source-pinned checksums, and
+Manual workflow dispatch builds Windows, macOS, and Linux artifacts, checks
+each unpacked resources tree for retired Telegram sidecar binaries/source, and
 uploads build artifacts. It does not publish a GitHub Release.
 
 ## Draft Release
@@ -37,7 +37,7 @@ Download and smoke-test the draft release assets before publishing the draft.
 If the draft is wrong, fix the issue before publishing; do not publish a known
 bad draft release.
 
-### v0.11.0 Draft Smoke Checklist
+### v0.13.0 Draft Smoke Checklist
 
 Use the draft release installer or package artifact, not `npm start`. Windows
 required items are the primary publish gate. If macOS or Linux hardware is not
@@ -47,13 +47,15 @@ notes.
 Before launching:
 
 - Download the draft release asset for the platform being tested.
-- Confirm the packaged app shows `0.11.0` metadata.
+- Confirm the packaged app shows `0.13.0` metadata.
 - Confirm packaged resources include `app.asar.unpacked/hooks`,
   `app.asar.unpacked/agents`, `app.asar.unpacked/extensions`,
-  `app.asar.unpacked/themes`, and `sidecars/cc-connect-clawd`.
+  and `app.asar.unpacked/themes`.
+- Confirm the retirement assertion passes and neither
+  `sidecars/cc-connect-clawd` nor any `cc-connect-clawd(.exe)` exists.
 - Confirm Windows artifacts are architecture-specific x64 / ARM64 installers,
   not a universal NSIS installer.
-- For migration smoke, install v0.10.0 first and save a copy of the old
+- For migration smoke, install v0.12.0 first and save a copy of the old
   `clawd-prefs.json` before upgrading.
 - For Reasonix smoke, prepare a machine with Reasonix initialized so
   `<Reasonix home>/` exists (`%APPDATA%\reasonix` on Windows,
@@ -65,9 +67,9 @@ Before launching:
 Required all-platform checks:
 
 - Fresh install, launch, pet appears, no error dialog.
-- Upgrade install over v0.10.0, launch, pet appears, no error dialog. This path
-  exercises prefs v11 to v12 migration.
-- Settings -> About shows `v0.11.0`, sourced from `app.getVersion()`.
+- Upgrade install over v0.12.0, launch, pet appears, no error dialog. Existing
+  agent installation/enabled flags and user theme/animation choices remain intact.
+- Settings -> About shows `v0.13.0`, sourced from `app.getVersion()`.
 - First-run tutorial opens once for a fresh profile; Finish, Skip, and OS close
   each persist `tutorialSeen=true` and do not reopen on restart.
 - Upgrade profile with no `tutorialSeen` sees the tutorial once; an already-seen
@@ -76,9 +78,9 @@ Required all-platform checks:
   macOS installs default to pet + menu-bar accessory with no Dock tile.
 - Settings -> General / Agents / Animation & Sound render correctly in all five
   languages, including sidebar SVG icons and the folded Animation Map subtab.
-- Settings -> About contributors include the seven v0.11.0 first-time
-  contributors: `zhaoxv210`, `serenNan`, `IatomicreactorI`, `quantai1314`,
-  `Git-creat7`, `undownding`, and `chrono-meta`.
+- Settings -> About contributors include the seven v0.13.0 first-time
+  contributors: `jiaxuan1101`, `kkirito16`, `200780381`, `Dxy2326`,
+  `lurui1997`, `JesmonX`, and `chen86860`.
 - Reinstall one existing hook-based agent, such as Codex, and confirm the
   packaged hook script can `require()` its dependencies.
 - Run one real Claude Code or Codex session and confirm the pet reacts to state
@@ -88,6 +90,16 @@ Required all-platform checks:
 - Codex official hook health: disable hooks / leave hooks unreviewed, confirm
   Agents badge or startup nudge reports attention, then repair/review and
   confirm it returns healthy.
+- Claude hook health: delete one managed hook script and atomically replace
+  `settings.json`; confirm the watcher/periodic audit repairs supported damage,
+  while a still-missing declared core event is never reported as a successful Fix.
+- Register two custom HTTP agents and send the same raw `session_id` from both;
+  confirm Dashboard keeps separate sessions, then disable/delete one and confirm
+  the other remains intact. Forged/stale `custom-` ids must be rejected.
+- Install WorkBuddy against the current `~/.workbuddy-ai/settings.json` path and
+  confirm state + Notification events arrive without Clawd taking over approval.
+- Install MiMo Code into a commented/trailing-comma JSONC config, exercise
+  Allow/Always/Deny and DND fallback, then uninstall and confirm user config is preserved.
 - Settings -> Agents -> Install Reasonix succeeds on Windows when paths contain
   spaces, and the written command uses the EncodedCommand path when needed.
 - Remote SSH profile with connect-on-launch connects after startup; repeat with
@@ -105,7 +117,7 @@ Recommended all-platform checks:
 - Right-click Hide pet / Show pet still works; while hidden, a newly arriving
   permission request still shows a bubble, by design.
 - Settings -> About -> Check for updates completes without an error.
-- Update labels never show a duplicated prefix such as `vv0.11.0`.
+- Update labels never show a duplicated prefix such as `vv0.13.0`.
 - Telegram approval cards show the final outcome for decisions made on Telegram
   and for approvals resolved elsewhere.
 - Scan the mobile PWA pairing URL on a phone and confirm session cards appear.
@@ -114,6 +126,9 @@ Recommended all-platform checks:
 
 Windows checks:
 
+- Required: cold-start the packaged app twice with a saved upgrade position;
+  the first rendered pet visual must appear at that position without using
+  "Bring Pet to Primary Display" / "将桌宠拉回主屏".
 - Required: fullscreen/borderless game or video app smoke. The pet should float
   over the fullscreen app when overlay mode is on; clicking or dragging the pet
   must not kick the app out of fullscreen.
@@ -122,6 +137,9 @@ Windows checks:
 - Required: drag a folder onto the pet and confirm a terminal opens in that
   directory.
 - Required: right-click New Session starts Claude Code without `0x800700c1`.
+- Required: prompt submission under Windows Terminal produces no visible
+  PowerShell flash; cloak/sleep/display-wake recovery restores the pet and tray
+  icon without a transient size jump.
 - Recommended: focus jump targets the correct terminal.
 - Recommended: after restart, the pet restores its saved position and Keep size
   across displays does not grow after DPI/display-scale changes.
@@ -133,6 +151,9 @@ macOS checks:
 - Required when macOS hardware is available: answer a permission with
   Ctrl+Shift+Y or Ctrl+Shift+N and confirm focus is not stolen back to the agent
   terminal.
+- Required when macOS hardware is available: while editing text in a permission
+  or elicitation bubble, the pet drops behind the input surface and the IME
+  candidate window remains visible; ending edit restores stationary behavior.
 - Recommended: jumping back to a session restores a minimized terminal window.
 - Recommended: dragging a folder onto the pet does not open a terminal and does
   not crash. This is intentionally disabled on macOS.
@@ -142,6 +163,8 @@ Linux checks:
 - Required when Linux hardware is available: Wayland session launches
   successfully and relaunches under XWayland when available; pet transparency
   and positioning work.
+- Required when Linux hardware is available: MiMo JSONC install/uninstall keeps
+  executable modes and comment-preserving writes correct on a POSIX filesystem.
 - Recommended for tmux users: focus jumps to the correct tmux pane.
 
 All required Windows items must pass before publishing the draft. Required macOS
@@ -149,12 +172,10 @@ and Linux items must pass when those machines are available. If any required
 item fails, fix it and create a new draft release; do not publish a known-bad
 draft.
 
-## Sidecar Dependency
+## Retired Telegram Sidecar Guard
 
-Clawd release builds do not consume upstream `cc-connect` latest artifacts. They
-download the fixed `cc-connect-clawd` fork release pinned by
-`scripts/fetch-sidecar-binaries.js`, verify SHA256 values pinned in that script,
-and package those binaries into app resources.
-
-When the sidecar needs an upstream update, publish a new fixed sidecar release
-from the fork first, then update the Clawd pin and rerun the fetch/verify tests.
+The legacy Telegram sidecar was removed in v0.14.0. Release builds must run
+`scripts/assert-no-retired-telegram-sidecar.js` against every unpacked target:
+Windows x64/arm64, macOS x64/arm64, and Linux x64. The assertion scans both the
+outer resources tree and the real `app.asar`; a retired executable or runtime
+module is a hard failure.

@@ -5,6 +5,12 @@ const { EventEmitter } = require("node:events");
 const { describe, it } = require("node:test");
 
 const initServer = require("../src/server");
+const { makeSessionKey } = require("../src/session-key");
+
+const localSessionKey = (rawSessionId) => makeSessionKey({
+  profileId: "local",
+  rawSessionId,
+});
 
 function makeFakeHttp() {
   let capturedHandler = null;
@@ -157,7 +163,7 @@ describe("Qwen Code /permission path", () => {
   it("returns no-decision for headless Qwen sessions before auto-pilot can allow", async () => {
     const sessionId = "qwen-code:headless";
     const { handler, pendingPermissions, shown } = startServer({
-      sessions: new Map([[sessionId, { agentId: "qwen-code", headless: true }]]),
+      sessions: new Map([[localSessionKey(sessionId), { agentId: "qwen-code", headless: true }]]),
     });
 
     const res = await callPermission(handler, {
@@ -201,12 +207,12 @@ describe("Qwen Code /permission path", () => {
     assert.strictEqual(entry.isQwenCode, true);
     assert.strictEqual(entry.agentId, "qwen-code");
     assert.deepStrictEqual(entry.suggestions, []);
-    assert.strictEqual(Object.prototype.hasOwnProperty.call(entry, "opencodeAlwaysCandidates"), false);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(entry, "familyAlwaysCandidates"), false);
     assert.strictEqual(entry.toolInputFingerprint, "abc123");
     assert.strictEqual(entry.toolUseId, "tool-1");
     assert.strictEqual(entry.model, "qwen3-coder-plus");
     assert.deepStrictEqual(updates[0], [
-      "qwen-code:s1",
+      localSessionKey("qwen-code:s1"),
       "notification",
       "PermissionRequest",
       {
@@ -216,6 +222,10 @@ describe("Qwen Code /permission path", () => {
         pidChain: [789, 456, 123],
         cwd: "/repo",
         model: "qwen3-coder-plus",
+        sessionAutomationIdentity: {
+          eligible: false,
+          reason: "identity-verification-required",
+        },
       },
     ]);
 

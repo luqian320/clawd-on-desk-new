@@ -1,4 +1,4 @@
-const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, powerMonitor, clipboard } = require("electron");
+const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, powerMonitor, clipboard, safeStorage } = require("electron");
 // ── Linux/Wayland: relaunch under XWayland so the pet is draggable (issue #441) ──
 // Native Wayland ignores client-side window positioning and blocks global cursor
 // queries, so the pet spawns centered, can't be dragged, and has no tracking;
@@ -69,6 +69,7 @@ if (_xwaylandRelaunch) {
 const { clampTextScale, scaleWidth, scaleHeight, resolveTextScaleForKey } = require("./text-scale");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { pathToFileURL } = require("url");
 const { EventEmitter } = require("events");
 const {
@@ -76,23 +77,37 @@ const {
   shouldOpenSettingsWindowFromArgv,
 } = require("./settings-window-icon");
 const createSettingsWindowRuntime = require("./settings-window");
+const createPermissionAutomationConfirmationRuntime = require("./permission-automation-confirmation");
 const {
   createSettingsSizePreviewSession,
 } = require("./settings-size-preview-session");
 const { registerSettingsIpc } = require("./settings-ipc");
 const createSettingsEffectRouter = require("./settings-effect-router");
+const {
+  getPetTintIdForTheme,
+  resolvePetTintPayload,
+  getPetAccessoryIdForTheme,
+  resolvePetAccessoryPayload,
+} = require("./pet-customization-catalog");
 const { registerSessionIpc } = require("./session-ipc");
+const { createSessionAutomationStore } = require("./session-automation-store");
+const { createSessionAutomationCoordinator } = require("./session-automation-coordinator");
+const {
+  selectSessionAutomationDialogParent,
+} = require("./session-automation-dialog-parent");
+const { createSessionFolderOpener } = require("./session-open-folder");
 const { registerPetInteractionIpc } = require("./pet-interaction-ipc");
 const { createSystemWakeRecovery } = require("./system-wake-recovery");
 const { formatLocalTimestamp } = require("./log-timestamp");
 const { launchClaudeSession, openTerminalAt } = require("./launch-claude");
 const { dialog: electronDialog } = require("electron");
 const initPermission = require("./permission");
+const { isPassiveNotifyEntry } = require("./passive-notify-entry");
 const { registerPermissionIpc } = initPermission;
-const { createTelegramApprovalSidecar } = require("./telegram-approval-sidecar");
 const telegramApprovalSettings = require("./telegram-approval-settings");
 const discordPresenceSettings = require("./discord-presence-settings");
 const { createDiscordPresenceBridge } = require("./discord-presence-rpc");
+const { resolveAgentDisplayName } = require("./agent-display-name");
 const { FeishuApprovalClient } = require("./feishu-approval-client");
 const feishuApprovalSettings = require("./feishu-approval-settings");
 const {
@@ -102,7 +117,6 @@ const {
   formatTelegramStatusDiagnostic,
 } = require("./telegram-approval-runtime-status");
 const { createTelegramMigrationController } = require("./telegram-migration-controller");
-const { createTelegramSidecarStatusBridge } = require("./telegram-sidecar-status-bridge");
 const initUpdateBubble = require("./update-bubble");
 const { registerUpdateBubbleIpc } = initUpdateBubble;
 const createSettingsAnimationOverridesMain = require("./settings-animation-overrides-main");
@@ -119,6 +133,7 @@ const {
   getProportionalPixelSize,
 } = require("./size-utils");
 const { keepOutOfTaskbar } = require("./taskbar");
+const { loadTrayNormalIcon, loadTrayFlashIcon } = require("./tray-flash-icon");
 const createTopmostRuntime = require("./topmost-runtime");
 const { WIN_TOPMOST_LEVEL } = createTopmostRuntime;
 const createThemeFadeSequencer = require("./theme-fade-sequencer");
@@ -138,7 +153,9 @@ const {
 } = require("./session-focus");
 const { focusCodexThreadTarget } = require("./session-focus-handoff");
 const { isSessionInProgress } = require("./state-session-snapshot");
-const { getAllAgents } = require("../agents/registry");
+const { restoreSessionsFromRecoveryLeases } = require("./session-recovery-loader");
+const { getAllAgents, getAgent } = require("../agents/registry");
+const { getAgentIconUrl } = require("./state-agent-icons");
 // ── Autoplay policy: allow sound playback without user gesture ──
 // MUST be set before any BrowserWindow is created (before app.whenReady)
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
@@ -173,6 +190,27 @@ const { createForegroundFullscreenProbe } = require("./win-fullscreen-detect");
 const _isForegroundFullscreen = createForegroundFullscreenProbe({
   isWin,
   onError: (err) => console.warn("Clawd: win-fullscreen-detect not available:", err && err.message),
+});
+
+// ── Windows: DWM cloak inspection + un-cloak (#525 self-heal) ──
+// Best-effort; degrades to "never cloaked / recovery no-op" when koffi/dwmapi
+// or the virtual-desktop COM manager is unavailable.
+const { createCloakInspector } = require("./win-cloak-recovery");
+const _cloakInspector = createCloakInspector({
+  isWin,
+  log: (line) => console.warn(`Clawd: ${line}`),
+});
+
+// ── Windows: foreground Windows Terminal probe (server-side wt_hwnd sample,
+// #627 residual) ──
+// Best-effort; degrades to "never sampled" (always null) if koffi/user32 is
+// unavailable, so a broken probe never blocks a /state POST — wt_hwnd just
+// falls back to the session's last-known value (state.js merge). Never spawns
+// a subprocess, so it cannot reproduce the console flash it exists to avoid.
+const { createForegroundWindowsTerminalProbe } = require("./win-foreground-terminal");
+const _captureForegroundWindowsTerminal = createForegroundWindowsTerminalProbe({
+  isWin,
+  onError: (err) => console.warn("Clawd: win-foreground-terminal not available:", err && err.message),
 });
 
 // ── Windows: switch the dev console to UTF-8 ──
@@ -228,29 +266,44 @@ const SIZES = {
 // `_settingsController.applyUpdate()`, which auto-persists.
 const prefsModule = require("./prefs");
 const { createSettingsController } = require("./settings-controller");
+const { loadOrCreateInstallationIdentity } = require("./remote-ssh-identity");
 const { createTranslator, i18n, SUPPORTED_LANGS } = require("./i18n");
 const {
   getBubblePolicy,
   isAllBubblesHidden,
 } = require("./bubble-policy");
 const loginItemHelpers = require("./login-item");
+const { writeCodexAutoStartGate } = require("../hooks/server-config");
 const PREFS_PATH = path.join(app.getPath("userData"), "clawd-prefs.json");
 const _initialPrefsLoad = prefsModule.load(PREFS_PATH);
+
+function _persistCodexAutoStartGate(enabled) {
+  return writeCodexAutoStartGate(enabled === true);
+}
+
+function _syncCodexAutoStartGate(snapshot, source) {
+  const codex = snapshot && snapshot.agents && snapshot.agents.codex;
+  if (_persistCodexAutoStartGate(!!(codex && codex.enabled === true))) return true;
+  console.warn(`Clawd: failed to sync Codex auto-start gate (${source})`);
+  return false;
+}
 
 // Lazy helpers — these run inside the action `effect` callbacks at click time,
 // long after server.js / hooks/install.js are loaded. Wrapping them in closures
 // avoids a chicken-and-egg require order at module load.
+//
+// All of these route through _server's Claude hook operation queue rather than
+// requiring hooks/install.js directly: every process-internal settings.json
+// mutation must be serialized against the fs watcher, periodic health audit,
+// and other Settings actions (#657).
 function _installAutoStartHook() {
-  const { registerHooks } = require("../hooks/install.js");
-  registerHooks({ silent: true, autoStart: true, port: getHookServerPort() });
+  return _server.setClaudeAutoStart({ enabled: true, source: "auto-start" });
 }
 function _uninstallAutoStartHook() {
-  const { unregisterAutoStart } = require("../hooks/install.js");
-  unregisterAutoStart();
+  return _server.setClaudeAutoStart({ enabled: false, source: "auto-start" });
 }
 async function _uninstallClaudeHooksNow() {
-  const { unregisterHooksAsync } = require("../hooks/install.js");
-  await unregisterHooksAsync();
+  return _server.uninstallClaudeHooks({ source: "settings", automatic: false });
 }
 
 // Cross-platform "open at login" writer used by both the openAtLogin effect
@@ -281,6 +334,26 @@ function _readSystemOpenAtLogin() {
   ).openAtLogin;
 }
 
+function _getAgentIntegrationOptions(agentId) {
+  const agents = _settingsController && _settingsController.get("agents");
+  const entry = agents && agents[agentId];
+  if (!entry || typeof entry !== "object") return {};
+  const options = {};
+  const agent = getAgent(agentId);
+  const capabilities = (agent && agent.capabilities) || {};
+  if (capabilities.httpHook && capabilities.customPermissionUrl) {
+    const customPermissionUrl = prefsModule.normalizeOptionalHttpUrl(entry.customPermissionUrl);
+    options.permissionTarget = customPermissionUrl
+      ? { mode: "custom", url: customPermissionUrl }
+      : { mode: "local" };
+  }
+  return options;
+}
+
+function _resolveAgentDisplayName(agentId) {
+  return resolveAgentDisplayName(agentId, _settingsController.get("customApplications"));
+}
+
 function _deferredResizePet(sizeKey) {
   // Bound to _menu.resizeWindow after menu module is created below. Settings
   // panel's size slider commands route through here so they get the same
@@ -309,6 +382,8 @@ function _restartClawdNow() {
 let shortcutRuntime = null;
 let themeRuntime = null;
 let agentRuntime = null;
+let sessionAutomationCoordinator = null;
+let sessionAutomationStore = null;
 let systemWakeRecovery = null;
 let floatingWindowRuntime = null;
 let focusModuleRuntime = null;
@@ -316,19 +391,17 @@ let focusHud = null;
 let focusReminderTimer = null;
 let focusNotice = null;
 let codexPetMain = null;
-let telegramApprovalSidecar = null;
-let telegramApprovalSyncPromise = Promise.resolve();
-let telegramApprovalConfigSignature = "";
-let telegramApprovalTokenRevision = 0;
+let telegramApprovalIdentitySignature = "";
 let _telegramMigrationController = null;
 let telegramNativeRunner = null;
 let telegramCompanion = null;
 let telegramDirectSend = null;
 let discordPresenceBridge = null;
-let suppressTelegramApprovalSidecarSync = 0;
+let suppressTelegramMigrationReconcile = 0;
 let feishuApprovalClient = null;
 let feishuApprovalSyncPromise = Promise.resolve();
 let feishuApprovalConfigSignature = "";
+let feishuSessionAutomationRouteSignature = "";
 let feishuApprovalSecretsRevision = 0;
 const shortcutHandlers = {
   togglePet: () => togglePetVisibility(),
@@ -340,21 +413,24 @@ const _settingsController = createSettingsController({
     installAutoStart: _installAutoStartHook,
     uninstallAutoStart: _uninstallAutoStartHook,
     resolveTextScaleDisplayKey: () => getSettingsDisplayKey(),
-    syncClaudeHooksNow: () => {
-      const { registerHooksAsync } = require("../hooks/install.js");
-      return registerHooksAsync({ silent: true, autoStart: autoStartWithClaude, port: getHookServerPort() });
-    },
+    syncClaudeHooksNow: () => _server.syncClawdHooks({ source: "settings", automatic: false }),
+    setClaudeQuotaCollectionEnabled: (enabled) => _server.setClaudeQuotaCollectionEnabled({
+      enabled,
+      source: "settings-quota-collection",
+    }),
     uninstallClaudeHooksNow: _uninstallClaudeHooksNow,
     startClaudeSettingsWatcher: () => _server.startClaudeSettingsWatcher(),
     stopClaudeSettingsWatcher: () => _server.stopClaudeSettingsWatcher(),
     setOpenAtLogin: _writeSystemOpenAtLogin,
     startMonitorForAgent: (id) => agentRuntime && agentRuntime.startMonitorForAgent(id),
     stopMonitorForAgent: (id) => agentRuntime && agentRuntime.stopMonitorForAgent(id),
-    syncIntegrationForAgent: (id) => agentRuntime ? agentRuntime.syncIntegrationForAgent(id) : false,
+    syncIntegrationForAgent: (id, options) =>
+      agentRuntime ? agentRuntime.syncIntegrationForAgent(id, options) : false,
     repairIntegrationForAgent: (id, options) =>
       agentRuntime ? agentRuntime.repairIntegrationForAgent(id, options) : false,
     stopIntegrationForAgent: (id) => agentRuntime ? agentRuntime.stopIntegrationForAgent(id) : false,
     uninstallIntegrationForAgent: (id) => agentRuntime ? agentRuntime.uninstallIntegrationForAgent(id) : false,
+    writeCodexAutoStartGate: _persistCodexAutoStartGate,
     deployHooksToWsl: async (distro, agentId) => {
       const { deployToWsl } = require("./wsl-deploy");
       return deployToWsl(distro, { agentId, isPackaged: app.isPackaged });
@@ -363,16 +439,25 @@ const _settingsController = createSettingsController({
       const { removeFromWsl } = require("./wsl-deploy");
       return removeFromWsl(distro, { agentId });
     },
-    cleanupIntegrations: (options = {}) => {
+    cleanupIntegrations: async (options = {}) => {
+      // Claude hooks + statusline unregister as one queue task, awaited here so
+      // it settles (and any in-flight repair drains) before the generic cleaner
+      // runs. hooks/cleanup-integrations.js records this precomputed result
+      // instead of unregistering Claude a second time outside the queue.
+      const claudeCleanupResult = await _server.uninstallClaudeHooks({ source: "cleanup", automatic: false });
       const { cleanupIntegrations } = require("../hooks/cleanup-integrations.js");
-      return cleanupIntegrations({ ...options, backup: true, silent: true });
+      return cleanupIntegrations({ ...options, backup: true, silent: true, claudeCleanupResult });
     },
     repairLocalServer: () => _server && typeof _server.repairRuntimeStatus === "function"
       ? _server.repairRuntimeStatus()
       : false,
     restartClawd: _restartClawdNow,
     clearSessionsByAgent: (id) => agentRuntime ? agentRuntime.clearSessionsByAgent(id) : 0,
+    clearSessionAutomationByAgent: (id) =>
+      sessionAutomationCoordinator ? sessionAutomationCoordinator.clearAgent(id) : [],
     dismissPermissionsByAgent: (id, options) => agentRuntime ? agentRuntime.dismissPermissionsByAgent(id, options) : 0,
+    clearRecentHookEvents: (id) => _server.clearRecentHookEvents(id),
+    identifyCustomApplication: (sourcePath) => require("./custom-applications").identifyCustomApplication(sourcePath),
     resizePet: _deferredResizePet,
     getActiveSessionAliasKeys: () =>
       _state && typeof _state.getActiveSessionAliasKeys === "function"
@@ -398,6 +483,7 @@ const _settingsController = createSettingsController({
       themeRuntime.refreshActiveThemeHitboxOverrides(id, overrideMap),
     getThemeInfo: (id) => themeRuntime.getThemeInfo(id),
     removeThemeDir: (id) => themeRuntime.removeThemeDir(id),
+    getActiveTheme: () => themeRuntime.getActiveTheme(),
     globalShortcut,
     shortcutHandlers,
     // The controller is created before shortcutRuntime because each side needs
@@ -408,6 +494,50 @@ const _settingsController = createSettingsController({
     },
   },
 });
+_settingsController.subscribeKey("agents", (_agents, snapshot) => {
+  // A future-version prefs file is intentionally read-only. Settings may still
+  // change in memory for the current process, but publishing those ephemeral
+  // values would let a retained hook cold-launch Clawd against the durable
+  // prefs truth.
+  if (_settingsController.isLocked()) return;
+  _syncCodexAutoStartGate(snapshot, "settings");
+});
+let _remoteSshInstallationIdentity = null;
+
+async function initializeRemoteSshInstallationIdentity() {
+  const remoteSsh = _settingsController.get("remoteSsh") || {};
+  const persistedAuthorityPresent = Array.isArray(remoteSsh.profiles)
+    && remoteSsh.profiles.some((profile) => profile && (
+      typeof profile.routingNonce === "string"
+      || typeof profile.previousNonce === "string"
+      || !!profile.identityTxn
+      || profile.isolatedActive === true
+      || !!profile.isolatedRuntime
+      || (Array.isArray(profile.managedDeployTargets) && profile.managedDeployTargets.length > 0)
+      || (Number.isFinite(profile.lastDeployedAt) && profile.lastDeployedAt > 0)
+    ));
+  const identity = loadOrCreateInstallationIdentity({
+    userDataDir: app.getPath("userData"),
+    expectedInstallId: remoteSsh.installId,
+    persistedAuthorityPresent,
+    safeStorage,
+  });
+  const result = await _settingsController.applyCommand("remoteSsh.applyInstallationIdentity", {
+    installId: identity.installId,
+    cloneRecoveryRequired: identity.cloneRecoveryRequired === true,
+  });
+  if (!result || result.status !== "ok") {
+    throw new Error((result && result.message) || "failed to bind Remote SSH installation identity");
+  }
+  _remoteSshInstallationIdentity = Object.freeze(identity);
+  if (identity.cloneRecoveryRequired) {
+    console.warn("Clawd remote-ssh: local installation identity changed; remote profiles require redeploy");
+  }
+  if (!identity.strongStorage) {
+    console.warn(`Clawd remote-ssh: installation binding uses weak storage backend (${identity.storageBackend})`);
+  }
+  return identity;
+}
 
 // Mirror of `_settingsController.get("lang")` so existing sync read sites in
 // menu.js / state.js / etc. don't have to round-trip through the controller.
@@ -591,6 +721,7 @@ const settingsWindowRuntime = createSettingsWindowRuntime({
   getPetWindowBounds: () => getPetWindowBounds(),
   getNearestWorkArea: (cx, cy) => getNearestWorkArea(cx, cy),
   getTextScale: () => effectiveTextScaleForKey(getSettingsDisplayKey()),
+  getTitle: () => translate("settingsWindowTitle"),
   onBeforeCreate: () => bumpAnimationOverridePreviewPosterGeneration(),
   onBeforeClosed: () => {
     bumpAnimationOverridePreviewPosterGeneration();
@@ -603,6 +734,15 @@ const settingsWindowRuntime = createSettingsWindowRuntime({
     endTextScalePreview();
   },
   onAfterClosed: () => maybeDestroyIdleAnimationPreviewPosterWindow(),
+});
+
+const permissionAutomationConfirmationRuntime = createPermissionAutomationConfirmationRuntime({
+  BrowserWindow,
+  ipcMain,
+  nativeTheme,
+  screen,
+  path,
+  iconPath: settingsWindowRuntime.getIconPath(),
 });
 
 function getSettingsWindow() {
@@ -716,15 +856,16 @@ const petWindowRuntime = createPetWindowRuntime({
   getMiniPeekOffset: () => _mini.PEEK_OFFSET,
   getCurrentPixelSize: () => getCurrentPixelSize(),
   getEffectiveCurrentPixelSize: (workArea) => getEffectiveCurrentPixelSize(workArea),
-  getKeepSizeAcrossDisplays: () => keepSizeAcrossDisplaysCached,
   getAllowEdgePinning: () => allowEdgePinningCached,
-  isProportionalMode: () => isProportionalMode(),
   getPrimaryWorkAreaSafe: () => getPrimaryWorkAreaSafe(),
   getNearestWorkArea,
   sendToRenderer,
   keepOutOfTaskbar,
   repositionSessionHud: () => repositionSessionHud(),
   repositionAnchoredSurfaces: () => repositionAnchoredFloatingSurfaces(),
+  // #640: hitbox changes without a window move (state switch, theme reload)
+  // must re-answer the editing-overlap question. (Lazy — defined below.)
+  syncImeEditingPetDodge: () => topmostRuntime.syncImeEditingPetDodge(),
   repositionFloatingBubbles: () => repositionFloatingBubbles(),
   showFloatingSurfacesForPet: () => floatingWindowRuntime.showFloatingSurfacesForPet(),
   hideFloatingSurfacesForPet: () => floatingWindowRuntime.hideFloatingSurfacesForPet(),
@@ -735,9 +876,22 @@ const petWindowRuntime = createPetWindowRuntime({
   reapplyMacVisibility: () => reapplyMacVisibility(),
   reassertWinTopmost: () => reassertWinTopmost(),
   scheduleHwndRecovery: () => scheduleHwndRecovery(),
+  cloakInspector: _cloakInspector,
+  isMiniAnimating: () => _mini.getIsAnimating(),
+  // Issue #690 plan §4.3.10's fourth reconcile protection period (lazy-bound
+  // like isMiniAnimating above — _roam is constructed after petWindowRuntime,
+  // but this closure isn't invoked until well after module load finishes).
+  isRoamAnimating: () => _roam.isRoamAnimating(),
   isNearWorkAreaEdge: (bounds) => isNearWorkAreaEdge(bounds),
   flushRuntimeStateToPrefs: () => flushRuntimeStateToPrefs(),
   handleMiniDisplayChange: () => _mini.handleDisplayChange(),
+  // Issue #690 plan §4.5 point 4.5-4: handleDisplayMetricsChanged() used to
+  // silently swallow topology changes that land mid-mini-transition (the
+  // `if (getMiniTransitioning()) return;` guard). Instead it now hands off to
+  // mini.js so the change isn't lost — mini marks pendingTopologyMaterialize
+  // and does exactly one final re-materialize against fresh topology at
+  // whichever of its own three transition-end points comes next.
+  notifyMiniTopologyChangedDuringTransition: () => _mini.notifyTopologyChangedDuringTransition(),
   exitMiniMode: () => exitMiniMode(),
 });
 
@@ -862,6 +1016,9 @@ let sessionHudEnabled = _settingsController.get("sessionHudEnabled");
 let sessionHudShowStateLabels = _settingsController.get("sessionHudShowStateLabels");
 let sessionHudShowElapsed = _settingsController.get("sessionHudShowElapsed");
 let sessionHudShowContextUsage = _settingsController.get("sessionHudShowContextUsage");
+let sessionHudShowQuota = _settingsController.get("sessionHudShowQuota");
+let claudeQuotaCollectionEnabled = _settingsController.get("claudeQuotaCollectionEnabled");
+let quotaMergeSources = _settingsController.get("quotaMergeSources");
 let sessionHudCleanupDetached = _settingsController.get("sessionHudCleanupDetached");
 let sessionHudPinned = _settingsController.get("sessionHudPinned");
 let sessionStaleMs = _settingsController.get("sessionStaleMs");
@@ -871,6 +1028,8 @@ let soundMuted = _settingsController.get("soundMuted");
 let soundVolume = _settingsController.get("soundVolume");
 let lowPowerIdleMode = _settingsController.get("lowPowerIdleMode");
 let keepAwakeWhileWorking = _settingsController.get("keepAwakeWhileWorking");
+let petTint = _settingsController.get("petTint");
+let petAccessory = _settingsController.get("petAccessory");
 let allowEdgePinningCached = _settingsController.get("allowEdgePinning");
 let disableMiniModeCached = _settingsController.get("disableMiniMode");
 let keepSizeAcrossDisplaysCached = _settingsController.get("keepSizeAcrossDisplays");
@@ -1035,8 +1194,19 @@ function syncSoundPreloads() {
 
 function setViewportOffsetY(offsetY) { return petWindowRuntime.setViewportOffsetY(offsetY); }
 function getPetWindowBounds() { return petWindowRuntime.getPetWindowBounds(); }
-function applyPetWindowBounds(bounds) { return petWindowRuntime.applyPetWindowBounds(bounds); }
-function applyPetWindowPosition(x, y) { return petWindowRuntime.applyPetWindowPosition(x, y); }
+// Issue #690 Phase 3: mini's per-frame applyMiniFrameBounds() needs opts
+// (workArea/edgeContext/assertNoYOffset) to actually reach
+// petWindowRuntime.applyPetWindowBounds() — this wrapper used to silently
+// drop a second argument, which would have made assertNoYOffset a no-op.
+function applyPetWindowBounds(bounds, opts) { return petWindowRuntime.applyPetWindowBounds(bounds, opts); }
+// PR #751 Codex deep review, rework batch A (coordinator-attributed fix):
+// this sibling wrapper had the exact same 2-param bug applyPetWindowBounds
+// above was fixed for — topmost-runtime.js's applyFreshNudge() (#525) calls
+// applyPetWindowPosition(x, y, { force: true }) specifically so the
+// compositor-refresh nudge writes natively even when the materialized
+// physical rect already matches current live bounds, but this wrapper
+// silently dropped that third argument, making force:true a no-op.
+function applyPetWindowPosition(x, y, opts) { return petWindowRuntime.applyPetWindowPosition(x, y, opts); }
 
 function syncHitStateAfterLoad() {
   sendToHitWin("hit-state-sync", {
@@ -1049,6 +1219,11 @@ function syncHitStateAfterLoad() {
 
 function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
   syncSoundPreloads();
+  const activeTheme = getActiveTheme();
+  const tintId = getPetTintIdForTheme(petTint, activeTheme && activeTheme._id);
+  sendToRenderer("pet-tint-change", resolvePetTintPayload(tintId, activeTheme));
+  const accessoryId = getPetAccessoryIdForTheme(petAccessory, activeTheme && activeTheme._id);
+  sendToRenderer("pet-accessory-change", resolvePetAccessoryPayload(accessoryId, activeTheme));
   sendToRenderer("low-power-idle-mode-change", lowPowerIdleMode);
   if (_mini.getMiniMode()) {
     sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
@@ -1143,27 +1318,24 @@ function flashTaskbar() {
 
   // Cache the normal icon on first call
   if (!trayFlashNormalIcon) {
-    if (process.platform === "darwin") {
-      trayFlashNormalIcon = nativeImage.createFromPath(
-        path.join(__dirname, "../assets/tray-iconTemplate.png")
-      );
-      trayFlashNormalIcon.setTemplateImage(true);
-    } else {
-      trayFlashNormalIcon = nativeImage.createFromPath(
-        path.join(__dirname, "../assets/tray-icon.png")
-      ).resize({ width: 32, height: 32 });
-    }
+    trayFlashNormalIcon = loadTrayNormalIcon({
+      nativeImage,
+      platform: process.platform,
+      templatePath: path.join(__dirname, "../assets/tray-iconTemplate.png"),
+      iconPath: path.join(__dirname, "../assets/icon.png"),
+    });
   }
 
-  // Cache the highlight icon (orange circle) on first call
+  // Cache the highlight icon (orange dot) on first call. #722: it has to come
+  // back at the same point size as the normal icon, otherwise each blink
+  // resizes the tray icon and reflows the menu bar.
   if (!trayFlashHighlightIcon) {
-    const flashPath = path.join(__dirname, "../assets/tray-icon-flash.png");
-    if (fs.existsSync(flashPath)) {
-      const img = nativeImage.createFromPath(flashPath).resize({ width: 32, height: 32 });
-      if (!img.isEmpty()) {
-        trayFlashHighlightIcon = img;
-      }
-    }
+    trayFlashHighlightIcon = loadTrayFlashIcon({
+      nativeImage,
+      platform: process.platform,
+      flashPath: path.join(__dirname, "../assets/tray-icon-flash.png"),
+      fileExists: (p) => fs.existsSync(p),
+    });
   }
 
   if (!trayFlashHighlightIcon) return;
@@ -1220,9 +1392,14 @@ let broadcastSessionHudSnapshot = () => {};
 let sendSessionHudI18n = () => {};
 let getSessionHudReservedOffset = () => 0;
 let getSessionHudWindow = () => null;
+let getQuotaRingWindow = () => null;
 const themeFadeSequencer = createThemeFadeSequencer({
   getRenderWindow: () => win,
   getHitWindow: () => hitWin,
+  // #640: while the pet dodges an editing bubble its baseline opacity is the
+  // faded value, not 1 — restoring to 1 mid-edit would plant an opaque pet on
+  // top of the box being typed into. (Lazy: topmostRuntime is defined below.)
+  getRestoreOpacity: () => topmostRuntime.getPetTargetOpacity(),
   fadeOutMs: THEME_SWITCH_FADE_OUT_MS,
   fadeInMs: THEME_SWITCH_FADE_IN_MS,
   fallbackMs: THEME_SWITCH_FADE_FALLBACK_MS,
@@ -1283,12 +1460,16 @@ const topmostRuntime = createTopmostRuntime({
   isMac,
   getWin: () => win,
   getHitWin: () => hitWin,
+  recoverCloakedPet: () => petWindowRuntime.recoverIfCloaked(),
   getPendingPermissions: () => pendingPermissions,
   getUpdateBubbleWindow: () => _updateBubble.getBubbleWindow(),
   getSessionHudWindow: () => getSessionHudWindow(),
+  getQuotaRingWindow: () => getQuotaRingWindow(),
   getContextMenuOwner: () => contextMenuOwner,
   getNearestWorkArea,
   getPetWindowBounds,
+  // #640: tight sprite rect for the editing-overlap dodge test
+  getHitRectScreen: (bounds) => getHitRectScreen(bounds),
   getShowDock: () => showDock,
   isDragLocked: () => petWindowRuntime.isDragLocked(),
   isMiniAnimating: () => _mini.getIsAnimating(),
@@ -1300,6 +1481,10 @@ const topmostRuntime = createTopmostRuntime({
   setForceEyeResend,
   applyPetWindowPosition,
   syncHitWin,
+  // I5 (plan §3): report the macOS editing-overlap dodge intent through
+  // pet-window-runtime's single ignore-mouse writer instead of this module
+  // calling hitWin.setIgnoreMouseEvents() directly.
+  setImeEditingPetDodge: (value) => petWindowRuntime.setImeEditingPetDodge(value),
 });
 const {
   reassertWinTopmost,
@@ -1313,6 +1498,7 @@ const {
 
 // ── Permission bubble — delegated to src/permission.js ──
 const {
+  isAgentIntegrationInstalled: _isAgentIntegrationInstalled,
   isAgentEnabled: _isAgentEnabled,
   isAgentPermissionsEnabled: _isAgentPermissionsEnabled,
   isAgentSubagentPermissionsEnabled: _isAgentSubagentPermissionsEnabled,
@@ -1339,15 +1525,55 @@ const _permCtx = {
   getFocusHudStyle: () => _settingsController.get("focusHudStyle") || "pixel",
   guardAlwaysOnTop,
   reapplyMacVisibility,
+  // #640: permission.js re-runs the editing-overlap dodge scan whenever the
+  // pendingPermissions list changes (notifyPermissionsChanged), so a bubble
+  // that leaves the list mid-edit can't strand the pet faded + click-through.
+  syncImeEditingPetDodge: () => topmostRuntime.syncImeEditingPetDodge(),
+  isAgentEnabled: (agentId) =>
+    _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
   isAgentPermissionsEnabled: (agentId) =>
     _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
-  // DANGER "auto-pilot": when true, showPermissionBubble auto-approves every
-  // request instead of rendering a bubble. DND / per-agent / headless gates
-  // run earlier in the route, so they still win — this only fires once a
-  // bubble would otherwise show. Headless fallback stays agent-specific
-  // (no-decision/native fallback, opencode silent TUI fallback, or CC deny).
-  isAutoApproveAllEnabled: () =>
-    _settingsController.get("autoApproveAllPermissions") === true,
+  isAgentSubagentPermissionsEnabled: (agentId) =>
+    _isAgentSubagentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
+  isCodexPermissionInterceptEnabled: () =>
+    _isCodexPermissionInterceptEnabled({ agents: _settingsController.get("agents") }),
+  // The permission layer consumes one normalized runtime mode. DND,
+  // headless, per-agent and bubble gates run before this chokepoint.
+  getPermissionAutomationMode: () =>
+    _settingsController.get("permissionAutomationMode") || "off",
+  getEffectivePermissionAutomationMode: (entry, options) =>
+    sessionAutomationCoordinator
+      ? sessionAutomationCoordinator.getEffectiveMode(entry, options)
+      : (_settingsController.get("permissionAutomationMode") || "off"),
+  hasSessionAutomationOverride: (entry) =>
+    !!(
+      sessionAutomationCoordinator
+      && sessionAutomationCoordinator.getRecordForEntry(entry)
+    ),
+  canOfferSessionTrust: (entry) =>
+    !!(sessionAutomationCoordinator && sessionAutomationCoordinator.canOfferSessionTrust(entry)),
+  translate: (key) => translate(key),
+  canOfferRemoteSessionTrust: (entry, remote) => {
+    const client = remote && remote.client;
+    return !!(
+      sessionAutomationCoordinator
+      && sessionAutomationCoordinator.canOfferSessionTrust(entry)
+      && client
+      && typeof client.supportsSessionAutomation === "function"
+      && client.supportsSessionAutomation()
+    );
+  },
+  requestSessionTrust: (entry) =>
+    sessionAutomationCoordinator
+      ? sessionAutomationCoordinator.requestEntryTrust(entry)
+      : Promise.resolve({ status: "unavailable" }),
+  requestRemoteSessionTrust: (entry, remote) =>
+    sessionAutomationCoordinator
+      ? sessionAutomationCoordinator.requestRemoteSessionTrust(entry, remote)
+      : Promise.resolve({ status: "unavailable" }),
+  cancelSessionTrustCandidate: (entry, options) =>
+    !!(sessionAutomationCoordinator
+      && sessionAutomationCoordinator.cancelSessionTrustCandidate(entry, options)),
   focusTerminalForSession: (sessionId, options = {}) => {
     focusDashboardSession(sessionId, {
       requestSource: options.requestSource || "permission-bubble",
@@ -1361,6 +1587,7 @@ const _permCtx = {
   reportShortcutFailure: (actionId, reason) => shortcutRuntime.reportFailure(actionId, reason),
   clearShortcutFailure: (actionId) => shortcutRuntime.clearFailure(actionId),
   repositionUpdateBubble: () => repositionUpdateBubble(),
+  repositionSessionHud: () => repositionSessionHud(),
   getTelegramApprovalClient: () => getTelegramApprovalClient(),
   getRemoteApprovalClients: () => {
     const client = getFeishuApprovalClient();
@@ -1374,7 +1601,7 @@ const _permCtx = {
   },
 };
 const _perm = initPermission(_permCtx);
-const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, maybeStartRemoteApproval, showCodexNotifyBubble, clearCodexNotifyBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionBubbleStyles, syncPermissionShortcuts, replyOpencodePermission } = _perm;
+const { showPermissionBubble, resolvePermissionEntry, sendPermissionResponse, repositionBubbles, permLog, PASSTHROUGH_TOOLS, addPendingPermission, removePendingPermission, isPermissionEntryLive, canAutoResolvePendingPermission, beginSessionTrustConfirmation, endSessionTrustConfirmation, syncPermissionBubbleContent, maybeStartRemoteApproval, showCodexNotifyBubble, clearCodexNotifyBubbles, showCodexUserInputBubble, clearCodexUserInputBubbles, showKimiNotifyBubble, clearKimiNotifyBubbles, syncPermissionBubbleStyles, syncPermissionShortcuts, replyOpencodeFamilyPermission } = _perm;
 const pendingPermissions = _perm.pendingPermissions;
 let permDebugLog = null; // set after app.whenReady()
 let updateDebugLog = null; // set after app.whenReady()
@@ -1394,6 +1621,7 @@ function getPendingPermissionFocusEntry(sessionId) {
   if (entry.pidChain) focusEntry.pidChain = entry.pidChain;
   if (entry.tmuxSocket) focusEntry.tmuxSocket = entry.tmuxSocket;
   if (entry.tmuxClient) focusEntry.tmuxClient = entry.tmuxClient;
+  if (entry.orcaPaneKey) focusEntry.orcaPaneKey = entry.orcaPaneKey;
   if (entry.host) focusEntry.host = entry.host;
   if (entry.platform) focusEntry.platform = entry.platform;
   if (entry.model) focusEntry.model = entry.model;
@@ -1416,6 +1644,7 @@ const _updateBubbleCtx = {
   getTextScale: () => getTextScaleForPetWindows(),
   guardAlwaysOnTop,
   reapplyMacVisibility,
+  repositionSessionHud: () => repositionSessionHud(),
 };
 const _updateBubble = initUpdateBubble(_updateBubbleCtx);
 const {
@@ -1443,7 +1672,12 @@ function repositionFloatingBubbles() {
 }
 
 function repositionAnchoredFloatingSurfaces() {
-  return floatingWindowRuntime.repositionAnchoredSurfaces();
+  const result = floatingWindowRuntime.repositionAnchoredSurfaces();
+  // #640: pet bounds changed — re-evaluate the editing-overlap dodge (a drag
+  // can slide the pet over the bubble being typed into; the bubble itself is
+  // frozen while editing, and roam is paused, so the pet is the mover here).
+  topmostRuntime.syncImeEditingPetDodge();
+  return result;
 }
 
 function syncSessionHudVisibilityAndBubbles() {
@@ -1460,10 +1694,44 @@ let sendDashboardI18n = () => {};
 // after the updater module is constructed below.
 let notifyUpdaterSilentExit = () => {};
 
+// #509: user-selected default idle visual, resolved against the live active
+// theme so reads never go stale across theme switches. Returns null when
+// unset/invalid — callers keep their existing fallback. The visible repaint
+// on a pref change is the refreshIdleVisual router hook's job, further down.
+const { resolveIdleVisualChoice } = require("./idle-visual");
+function getIdleVisualChoice() {
+  return resolveIdleVisualChoice(getActiveTheme(), _settingsController.get("idleVisual"));
+}
+
+// Renderer theme config with pre-IPC choices stamped on — the first media load
+// should already use the selected idle visual and tint instead of briefly
+// showing theme defaults. getRendererConfig() returns a fresh object, safe to
+// extend.
+function buildRendererThemeConfig() {
+  const cfg = themeRuntime.getRendererConfig();
+  if (cfg) {
+    const activeTheme = getActiveTheme();
+    const tintSelections = _settingsController.get("petTint");
+    const tintId = getPetTintIdForTheme(tintSelections, activeTheme && activeTheme._id);
+    const accessorySelections = _settingsController.get("petAccessory");
+    const accessoryId = getPetAccessoryIdForTheme(
+      accessorySelections,
+      activeTheme && activeTheme._id
+    );
+    cfg.idleDefaultVisual = getIdleVisualChoice();
+    cfg.petTintPayload = resolvePetTintPayload(tintId, activeTheme);
+    cfg.accessoryPayload = resolvePetAccessoryPayload(accessoryId, activeTheme);
+  }
+  return cfg;
+}
+
 const _stateCtx = {
   get theme() { return getActiveTheme(); },
   get win() { return win; },
   get hitWin() { return hitWin; },
+  // Last-known account quota survives app restarts (state-account-quota.js).
+  accountQuotaPersistPath: require("./state-account-quota").DEFAULT_PERSIST_PATH,
+  get quotaMergeSources() { return quotaMergeSources; },
   get doNotDisturb() { return doNotDisturb; },
   set doNotDisturb(v) { doNotDisturb = v; },
   get miniMode() { return _mini.getMiniMode(); },
@@ -1502,6 +1770,7 @@ const _stateCtx = {
   // boundary) keeps the gate consistent for hook / log-poll / plugin paths.
   isAgentNotificationHookEnabled: (agentId) =>
     _isAgentNotificationHookEnabled({ agents: _settingsController.get("agents") }, agentId),
+  resolveAgentDisplayName: _resolveAgentDisplayName,
   miniPeekIn: () => miniPeekIn(),
   miniPeekOut: () => miniPeekOut(),
   buildContextMenu: () => buildContextMenu(),
@@ -1542,6 +1811,15 @@ const _stateCtx = {
     detachedIdleStaleMs,
   }),
   getSessionAliases: () => _settingsController.get("sessionAliases"),
+  getSessionAutomationRecords: () =>
+    sessionAutomationStore ? sessionAutomationStore.list() : [],
+  getPermissionAutomationMode: () =>
+    _settingsController.get("permissionAutomationMode") || "off",
+  onSessionAutomationLifecycleEnd: (payload) => {
+    if (sessionAutomationCoordinator) sessionAutomationCoordinator.onSessionLifecycleEnd(payload);
+  },
+  getIdleVisualChoice,
+  isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
   hasAnyEnabledAgent: () => {
     // `get("agents")` returns the live reference (no clone) — we're only
     // reading. Missing agents field falls back to "assume enabled" (the
@@ -1564,6 +1842,51 @@ const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride
         startWakePoll, stopWakePoll, detectRunningAgentProcesses,
         startStartupRecovery: _startStartupRecovery } = _state;
 const sessions = _state.sessions;
+
+async function showSessionAutomationWarning(entry) {
+  const parent = selectSessionAutomationDialogParent({
+    entry,
+    petWindow: win,
+  });
+  return permissionAutomationConfirmationRuntime.confirmPermissionAutomation({
+    parent,
+    lang: _settingsController.get("lang") || lang || "en",
+    title: translate("sessionAutomationConfirmTitle"),
+    message: translate("sessionAutomationConfirmMessage"),
+    detail: translate("sessionAutomationConfirmDetail"),
+    checkboxLabel: translate("permissionAutomationAutoToolsDontShowAgain"),
+    confirmLabel: translate("sessionAutomationConfirmEnable"),
+    cancelLabel: translate("permissionAutomationCancel"),
+  });
+}
+
+sessionAutomationStore = createSessionAutomationStore({
+  onChange: (changes) => {
+    try { _state.emitSessionSnapshot({ force: true }); } catch {}
+    for (const client of [telegramNativeRunner, feishuApprovalClient]) {
+      if (client && typeof client.handleSessionAutomationChanges === "function") {
+        try { client.handleSessionAutomationChanges(changes); } catch {}
+      }
+    }
+  },
+});
+sessionAutomationCoordinator = createSessionAutomationCoordinator({
+  store: sessionAutomationStore,
+  getSession: (sessionId) => sessions.get(sessionId) || null,
+  listPending: () => pendingPermissions,
+  getGlobalMode: () => _settingsController.get("permissionAutomationMode") || "off",
+  canAutoResolvePendingPermission,
+  resolvePermissionEntry,
+  beginConfirmation: beginSessionTrustConfirmation,
+  endConfirmation: endSessionTrustConfirmation,
+  restoreBubble: syncPermissionBubbleContent,
+  isWarningDismissed: () =>
+    _settingsController.get("permissionAutomationAutoToolsWarningDismissed") === true,
+  showWarning: showSessionAutomationWarning,
+  rememberWarning: () =>
+    _settingsController.applyUpdate("permissionAutomationAutoToolsWarningDismissed", true),
+  translate: (key, fallback) => translate(key) || fallback,
+});
 
 // ── Keep-awake: block OS sleep while any agent task is in progress ──
 // State→in-progress mapping lives in state-session-snapshot.isSessionInProgress
@@ -1632,6 +1955,7 @@ const _tickCtx = {
   sendToHitWin,
   setState,
   applyState,
+  getIdleVisualChoice,
   miniPeekIn: () => miniPeekIn(),
   miniPeekOut: () => miniPeekOut(),
   getObjRect,
@@ -1659,7 +1983,7 @@ function getFocusableLocalHudSessionIds() {
 }
 
 function focusTerminalSession(session, sessionId, requestSource) {
-  if (!session || !session.sourcePid) return false;
+  if (!session || (!session.sourcePid && !session.orcaPaneKey)) return false;
   return focusTerminalWindow({
     sourcePid: session.sourcePid,
     wtHwnd: session.wtHwnd,
@@ -1668,6 +1992,7 @@ function focusTerminalSession(session, sessionId, requestSource) {
     pidChain: session.pidChain,
     tmuxSocket: session.tmuxSocket,
     tmuxClient: session.tmuxClient,
+    orcaPaneKey: session.orcaPaneKey,
     ghosttyTerminalId: session.ghosttyTerminalId,
     sessionId: String(sessionId),
     agentId: session.agentId,
@@ -1725,6 +2050,11 @@ function hideDashboardSession(sessionId) {
     : { status: "not-found" };
 }
 
+const openDashboardSessionFolder = createSessionFolderOpener({
+  getSession: (sessionId) => sessions.get(sessionId),
+  openPath: (cwd) => shell.openPath(cwd),
+});
+
 const _dashboard = require("./dashboard")({
   get lang() { return lang; },
   t: (key) => translate(key),
@@ -1762,6 +2092,7 @@ function buildTutorialAgentOnboardingState() {
     detectionAgents: detection.agents,
     agentsPref: _settingsController.get("agents") || {},
     installableIds: INSTALLABLE_AGENT_IDS,
+    getAgentIconUrl,
   });
 }
 
@@ -1858,6 +2189,7 @@ const _sessionHud = require("./session-hud")({
   get sessionHudShowStateLabels() { return sessionHudShowStateLabels; },
   get sessionHudShowElapsed() { return sessionHudShowElapsed; },
   get sessionHudShowContextUsage() { return sessionHudShowContextUsage; },
+  get sessionHudShowQuota() { return sessionHudShowQuota; },
   get sessionHudPinned() { return sessionHudPinned; },
   get lowPowerIdleMode() { return lowPowerIdleMode; },
   getMiniMode: () => _mini.getMiniMode(),
@@ -1869,6 +2201,8 @@ const _sessionHud = require("./session-hud")({
   getSessionHudAnchorRect,
   getNearestWorkArea,
   getTextScale: () => getTextScaleForPetWindows(),
+  getPermissionBubbleBounds: () => _perm.getVisibleBubbleBounds(),
+  getUpdateBubbleWindow: () => _updateBubble.getBubbleWindow(),
   guardAlwaysOnTop,
   reapplyMacVisibility,
   onReservedOffsetChange: () => repositionFloatingBubbles(),
@@ -1879,6 +2213,7 @@ broadcastSessionHudSnapshot = _sessionHud.broadcastSessionSnapshot;
 sendSessionHudI18n = _sessionHud.sendI18n;
 getSessionHudReservedOffset = _sessionHud.getHudReservedOffset;
 getSessionHudWindow = _sessionHud.getWindow;
+getQuotaRingWindow = _sessionHud.getQuotaRingWindow;
 
 // ── Focus module ──
 // Activity history is intentionally separate from prefs: prefs remain the
@@ -1999,12 +2334,15 @@ agentRuntime = createAgentRuntimeMain({
   captureGhosttyTerminalId,
   showCodexNotifyBubble: (...args) => showCodexNotifyBubble(...args),
   clearCodexNotifyBubbles: (...args) => clearCodexNotifyBubbles(...args),
+  showCodexUserInputBubble: (...args) => showCodexUserInputBubble(...args),
+  clearCodexUserInputBubbles: (...args) => clearCodexUserInputBubbles(...args),
 });
 
 // ── HTTP server — delegated to src/server.js ──
 const _serverCtx = {
   get manageClaudeHooksAutomatically() { return manageClaudeHooksAutomatically; },
   get autoStartWithClaude() { return autoStartWithClaude; },
+  get claudeQuotaCollectionEnabled() { return claudeQuotaCollectionEnabled; },
   get doNotDisturb() { return doNotDisturb; },
   shouldDropForDnd: () => _state.shouldDropForDnd ? _state.shouldDropForDnd() : doNotDisturb,
   get hideBubbles() { return getAllBubblesHidden(); },
@@ -2013,9 +2351,29 @@ const _serverCtx = {
   get PASSTHROUGH_TOOLS() { return PASSTHROUGH_TOOLS; },
   get STATE_SVGS() { return _state.STATE_SVGS; },
   get sessions() { return sessions; },
+  getCustomAgentIds: () => (_settingsController.get("customApplications") || [])
+    .map((application) => application && application.id)
+    .filter(Boolean),
+  onHookEventRecorded: (event) => {
+    if (!event || event.route !== "state" || event.outcome !== "accepted") return;
+    const registered = (_settingsController.get("customApplications") || [])
+      .some((application) => application && application.id === event.agentId);
+    if (!registered) return;
+    broadcastSettingsWindow("settings:agent-activity", {
+      agentId: event.agentId,
+      timestamp: event.timestamp,
+      eventType: event.eventType,
+    });
+  },
+  // #627 residual: synchronous server-side wt_hwnd sample for UserPromptSubmit
+  // (src/server-route-state.js). Initialized once above; never re-created per
+  // request.
+  captureForegroundWindowsTerminal: _captureForegroundWindowsTerminal,
+  debugLog: (msg) => sessionLog(msg),
   isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
   shouldSyncAgentIntegration: (agentId) =>
     _shouldSyncAgentIntegration({ agents: _settingsController.get("agents") }, agentId),
+  getAgentIntegrationOptions: _getAgentIntegrationOptions,
   isAgentPermissionsEnabled: (agentId) => _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   isAgentSubagentPermissionsEnabled: (agentId) => _isAgentSubagentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
   isCodexNativeNotificationSoundEnabled: () => _isCodexNativeNotificationSoundEnabled({ agents: _settingsController.get("agents") }),
@@ -2024,13 +2382,21 @@ const _serverCtx = {
   setState,
   updateSession: agentRuntime.updateSessionFromServer,
   updateSessionMetadata: (sessionId, opts) => _state.updateSessionMetadata(sessionId, opts),
+  updateAccountQuota: (host, quotas) => _state.updateAccountQuota(host, quotas),
   resolvePermissionEntry,
   sendPermissionResponse,
   addPendingPermission,
   removePendingPermission,
+  isPermissionEntryLive,
+  canAutoResolvePendingPermission,
+  maybeAutoResolveSessionPermission: (entry, options) =>
+    !!(sessionAutomationCoordinator
+      && sessionAutomationCoordinator.resolveIfAllowed(entry, options)),
   showPermissionBubble,
+  showCodexUserInputBubble,
+  clearCodexUserInputBubbles,
   maybeStartRemoteApproval,
-  replyOpencodePermission,
+  replyOpencodeFamilyPermission,
   syncPermissionShortcuts,
   permLog,
 };
@@ -2091,14 +2457,10 @@ function getTelegramApprovalClient() {
       return null;
     }
   }
-  if (!telegramApprovalSidecar || typeof telegramApprovalSidecar.getClient !== "function") return null;
-  return telegramApprovalSidecar.getClient();
+  return null;
 }
 
-// R1a companion notifications are native-only: the legacy sidecar has no
-// sendNotification surface, so legacy users silently lack completion pings
-// (Settings copy must say so — tracked for a follow-up UI pass). Unlike
-// getTelegramApprovalClient this never falls back to the sidecar.
+// Completion notifications are native-only.
 function getTelegramCompanionClient() {
   const controller = _telegramMigrationController;
   if (controller && typeof controller.getSnapshot === "function") {
@@ -2163,6 +2525,31 @@ function getTelegramApprovalPrefs() {
   return telegramApprovalSettings.normalizeTelegramApproval(_settingsController.get("tgApproval"));
 }
 
+function getTelegramSessionAutomationRoute() {
+  const config = getTelegramApprovalPrefs();
+  const token = getTelegramApprovalTokenStatus();
+  const migration = getTelegramMigrationPrefs();
+  const key = config && config.targetSessionKey;
+  const match = typeof key === "string" ? key.match(/^telegram:(-?\d+)/) : null;
+  return {
+    transport: typeof migration.transport === "string" ? migration.transport : "off",
+    allowedUserId: (config && config.allowedTgUserId) || "",
+    chatId: match ? match[1] : "",
+    tokenStored: !!(token && token.tokenStored),
+    tokenFileMtimeMs: (token && token.tokenFileMtimeMs) || 0,
+    tokenFileDigest: telegramTokenFileDigest(getTelegramApprovalPaths().tokenEnvFilePath),
+  };
+}
+
+function syncTelegramSessionAutomationRoute(route = getTelegramSessionAutomationRoute()) {
+  if (
+    telegramNativeRunner
+    && typeof telegramNativeRunner.syncSessionAutomationRoute === "function"
+  ) {
+    telegramNativeRunner.syncSessionAutomationRoute(route);
+  }
+}
+
 function getFeishuApprovalPrefs() {
   return feishuApprovalSettings.normalizeFeishuApproval(_settingsController.get("feishuApproval"));
 }
@@ -2188,16 +2575,12 @@ function hasCompleteTelegramApprovalConfig(config, tokenInfo) {
   );
 }
 
-function isTelegramLegacySidecarSyncAllowed() {
-  const migration = getTelegramMigrationPrefs();
-  if (migration.transport === "native" || migration.transport === "off") return false;
-  const controller = _telegramMigrationController;
-  if (controller && typeof controller.getSnapshot === "function") {
-    const snap = controller.getSnapshot() || {};
-    if (snap.state === "NATIVE_ACTIVE" || snap.state === "TESTING_NATIVE") return false;
-    if (snap.transport === "native" || snap.transport === "off") return false;
-  }
-  return true;
+function buildTelegramApprovalIdentitySignature(config) {
+  const normalized = telegramApprovalSettings.normalizeTelegramApproval(config);
+  return JSON.stringify({
+    allowedTgUserId: normalized.allowedTgUserId,
+    targetSessionKey: normalized.targetSessionKey,
+  });
 }
 
 async function applySettingsUpdateOrThrow(key, value, label) {
@@ -2211,34 +2594,33 @@ async function applySettingsUpdateOrThrow(key, value, label) {
 async function setTelegramApprovalEnabledForMigration(enabled) {
   const current = getTelegramApprovalPrefs();
   if (current.enabled === enabled) return;
-  suppressTelegramApprovalSidecarSync += 1;
+  suppressTelegramMigrationReconcile += 1;
   try {
     await applySettingsUpdateOrThrow("tgApproval", { ...current, enabled }, "tgApproval");
   } finally {
-    suppressTelegramApprovalSidecarSync = Math.max(0, suppressTelegramApprovalSidecarSync - 1);
+    suppressTelegramMigrationReconcile = Math.max(0, suppressTelegramMigrationReconcile - 1);
   }
 }
 
 async function persistTelegramMigrationPatch(patch) {
   const cur = getTelegramMigrationPrefs();
-  await applySettingsUpdateOrThrow("tgMigration", { ...cur, ...patch }, "tgMigration");
-  if (patch && patch.transport === "legacy") {
-    await setTelegramApprovalEnabledForMigration(true);
-  } else if (patch && (patch.transport === "native" || patch.transport === "off")) {
+  // Disable the retired v0.8 flag before publishing the native/off transport
+  // decision. If either write fails, the controller never exposes the target
+  // state in memory; this ordering also prevents a partial write from reviving
+  // legacy behavior in an older build.
+  if (patch && (patch.transport === "native" || patch.transport === "off")) {
     await setTelegramApprovalEnabledForMigration(false);
   }
+  await applySettingsUpdateOrThrow("tgMigration", { ...cur, ...patch }, "tgMigration");
 }
 
 // Canonical paths only — no env-var override. The Settings "Save token" button,
-// the sidecar's bridge TOML, and tokenStatus all share this single location so
-// a malicious or accidental CLAWD_TG_BOT_TOKEN_FILE / CLAWD_BRIDGE_CONFIG can't
-// redirect the writer to an attacker-controlled path or split the writer/reader
-// view of where the token lives.
+// native token store, and tokenStatus all share this single location so a
+// malicious or accidental env override cannot redirect the writer.
 function getTelegramApprovalPaths() {
   const userDataDir = app.getPath("userData");
   return {
     userDataDir,
-    configPath: telegramApprovalSettings.defaultBridgeConfigPath(userDataDir),
     tokenEnvFilePath: telegramApprovalSettings.defaultTokenEnvFilePath(userDataDir),
   };
 }
@@ -2267,9 +2649,16 @@ function getFeishuApprovalSecretInfo() {
   });
 }
 
+// Anything that changes the live connection must be in here. `platform` in
+// particular: switching Feishu <-> Lark has to tear the client down so the WS
+// reconnects to the new host and the cached REST client (and its token cache,
+// which is per-domain) is dropped with it. `lang` is deliberately absent — the
+// translator reads it dynamically, so a language switch must not bounce the
+// long connection.
 function buildFeishuApprovalSignature(config, paths, secrets) {
   return JSON.stringify({
     enabled: config.enabled === true,
+    platform: config.platform,
     idType: config.idType,
     approverId: config.approverId,
     secretsEnvFilePath: paths.secretsEnvFilePath,
@@ -2282,6 +2671,38 @@ function buildFeishuApprovalSignature(config, paths, secrets) {
   });
 }
 
+function buildFeishuSessionAutomationRouteSignature(config, secrets, revision = feishuApprovalSecretsRevision) {
+  return JSON.stringify({
+    enabled: config.enabled === true,
+    platform: config.platform,
+    idType: config.idType,
+    approverId: config.approverId,
+    appId: secrets.appId,
+    appSecret: secrets.appSecret ? "set" : "",
+    verificationToken: secrets.verificationToken ? "set" : "",
+    encryptKey: secrets.encryptKey ? "set" : "",
+    secretsRevision: revision,
+  });
+}
+
+function prepareFeishuSessionAutomationRouteChange(nextRouteSignature) {
+  const client = feishuApprovalClient;
+  if (
+    !client
+    || !feishuSessionAutomationRouteSignature
+    || nextRouteSignature === feishuSessionAutomationRouteSignature
+  ) {
+    return false;
+  }
+  if (typeof client.markSessionAutomationRouteStale === "function") {
+    client.markSessionAutomationRouteStale();
+  }
+  if (sessionAutomationCoordinator) {
+    sessionAutomationCoordinator.onRemoteClientRouteChange(client);
+  }
+  return true;
+}
+
 function getFeishuApprovalStatus() {
   const config = getFeishuApprovalPrefs();
   const secrets = getFeishuApprovalSecrets();
@@ -2292,11 +2713,20 @@ function getFeishuApprovalStatus() {
   return {
     ...clientStatus,
     enabled: config.enabled === true,
+    // The platform the runtime actually resolved, so the settings page renders
+    // the right brand/guide and a mismatch is visible while troubleshooting.
+    platform: config.platform,
     configured: ready.ready === true,
     reason: ready.reason || "",
     message: clientStatus.message || ready.message || "",
     connectionTimeoutSeconds: config.connectionTimeoutSeconds,
+    // Two different questions, deliberately two fields:
+    //   secretsStored     — is ANY secret on disk? (drives render gating only)
+    //   secretsConfigured — are the two REQUIRED ones both present?
+    // Conflating them lets a half-written env file (App ID but no App Secret,
+    // or just a Verification Token) render as a complete setup.
     secretsStored: !!(secrets.appId || secrets.appSecret || secrets.verificationToken || secrets.encryptKey),
+    secretsConfigured: !!(secrets.appId && secrets.appSecret),
   };
 }
 
@@ -2309,6 +2739,11 @@ function broadcastFeishuApprovalStatus() {
 
 function writeFeishuApprovalSecrets(secrets) {
   const paths = getFeishuApprovalPaths();
+  prepareFeishuSessionAutomationRouteChange(buildFeishuSessionAutomationRouteSignature(
+    getFeishuApprovalPrefs(),
+    secrets && typeof secrets === "object" ? secrets : {},
+    feishuApprovalSecretsRevision + 1
+  ));
   const result = feishuApprovalSettings.writeSecretsEnvFile({
     fs,
     path,
@@ -2319,6 +2754,11 @@ function writeFeishuApprovalSecrets(secrets) {
   if (result && result.status === "ok") {
     feishuApprovalSecretsRevision += 1;
     queueFeishuApprovalSync("secrets");
+  } else if (
+    feishuApprovalClient
+    && typeof feishuApprovalClient.markSessionAutomationRouteCurrent === "function"
+  ) {
+    feishuApprovalClient.markSessionAutomationRouteCurrent();
   }
   return result;
 }
@@ -2338,6 +2778,7 @@ async function startFeishuApprovalClient() {
     return false;
   }
   const signature = buildFeishuApprovalSignature(config, paths, secrets);
+  const routeSignature = buildFeishuSessionAutomationRouteSignature(config, secrets);
   if (feishuApprovalClient && feishuApprovalConfigSignature === signature) {
     try {
       await feishuApprovalClient.start();
@@ -2347,7 +2788,12 @@ async function startFeishuApprovalClient() {
       return false;
     }
   }
-  stopFeishuApprovalClient();
+  const handoffCardWork = feishuApprovalClient
+    && feishuSessionAutomationRouteSignature === routeSignature
+    ? feishuApprovalClient.sessionAutomationCardWork
+    : null;
+  prepareFeishuSessionAutomationRouteChange(routeSignature);
+  stopFeishuApprovalClient({ routeChanging: false, preserveRouteSignature: !!handoffCardWork });
   feishuApprovalClient = new FeishuApprovalClient({
     appId: secrets.appId,
     appSecret: secrets.appSecret,
@@ -2355,11 +2801,19 @@ async function startFeishuApprovalClient() {
     encryptKey: secrets.encryptKey,
     approverId: config.approverId,
     idType: config.idType,
+    platform: config.platform,
     connectionTimeoutSeconds: config.connectionTimeoutSeconds,
+    getLang: () => _settingsController.get("lang") || lang || "en",
     log: feishuApprovalLog,
     onStatusChange: () => broadcastFeishuApprovalStatus(),
+    sessionAutomationCardWork: handoffCardWork,
+    onSessionGrantRevoke: (grantId) =>
+      sessionAutomationCoordinator
+        ? sessionAutomationCoordinator.revokeRemoteGrant({ grantId })
+        : { status: "stale" },
   });
   feishuApprovalConfigSignature = signature;
+  feishuSessionAutomationRouteSignature = routeSignature;
   try {
     await feishuApprovalClient.start();
     feishuApprovalLog("info", "starting");
@@ -2370,10 +2824,16 @@ async function startFeishuApprovalClient() {
   }
 }
 
-function stopFeishuApprovalClient() {
+function stopFeishuApprovalClient(options = {}) {
   const client = feishuApprovalClient;
+  if (options.routeChanging !== false) {
+    prepareFeishuSessionAutomationRouteChange("");
+  }
   feishuApprovalClient = null;
   feishuApprovalConfigSignature = "";
+  if (options.preserveRouteSignature !== true) {
+    feishuSessionAutomationRouteSignature = "";
+  }
   if (client && typeof client.close === "function") {
     try { client.close(); } catch (err) {
       feishuApprovalLog("warn", "stop failed", { error: err && err.message ? err.message : String(err) });
@@ -2401,43 +2861,61 @@ function queueFeishuApprovalSync(reason) {
   return feishuApprovalSyncPromise;
 }
 
+// Brand-neutral: this channel now serves Feishu and Lark, and `message` is the
+// untranslated fallback shown when the renderer has no mapping for `code`.
+// Naming one brand here would tell half the users their working setup is wrong.
 function feishuApprovalUnavailableMessage(status) {
   if (status && status.message) return status.message;
-  if (status && status.reason === "disabled") return "Feishu approval is disabled";
-  if (status && status.reason === "missing-secret") return "Feishu App ID and App Secret are not configured";
-  if (status && status.reason === "invalid-config") return "Feishu approval config is incomplete";
-  return "Feishu approval client is not running";
+  if (status && status.reason === "disabled") return "Remote approval is disabled";
+  if (status && status.reason === "missing-secret") return "App ID and App Secret are not configured";
+  if (status && status.reason === "invalid-config") return "Remote approval config is incomplete";
+  return "Remote approval client is not running";
+}
+
+// The `code` field lets the renderer map failures to localized, actionable
+// toasts; `message` stays as the untranslated fallback.
+function feishuApprovalUnavailableResult(status) {
+  return {
+    status: "error",
+    code: (status && status.reason) || "not-running",
+    message: feishuApprovalUnavailableMessage(status),
+  };
 }
 
 async function sendFeishuApprovalTest() {
   const beforeStatus = getFeishuApprovalStatus();
   if (beforeStatus.configured !== true) {
-    return { status: "error", message: feishuApprovalUnavailableMessage(beforeStatus) };
+    return feishuApprovalUnavailableResult(beforeStatus);
   }
   await queueFeishuApprovalSync("test");
   const client = getConfiguredFeishuApprovalClient();
   if (!client || typeof client.requestApproval !== "function") {
-    return { status: "error", message: feishuApprovalUnavailableMessage(getFeishuApprovalStatus()) };
+    return feishuApprovalUnavailableResult(getFeishuApprovalStatus());
   }
   if (typeof client.waitUntilConnected === "function") {
     const config = getFeishuApprovalPrefs();
     const timeoutMs = Math.max(1, Number(config.connectionTimeoutSeconds) || 15) * 1000;
     const connected = await client.waitUntilConnected(timeoutMs);
     if (!connected) {
-      return { status: "error", message: feishuApprovalUnavailableMessage(getFeishuApprovalStatus()) };
+      return { ...feishuApprovalUnavailableResult(getFeishuApprovalStatus()), code: "not-connected" };
     }
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60 * 1000);
   try {
+    // Title/detail go through the same dictionary the client uses for the
+    // buttons, so the test card can no longer mix an English heading with
+    // Chinese buttons.
     const decision = await client.requestApproval({
-      title: "Clawd Feishu approval test",
-      detail: "This is a settings test message. It is not attached to any agent permission request.",
-    }, { signal: controller.signal });
+      title: translate("feishuCardTestTitle"),
+      detail: translate("feishuCardTestDetail"),
+    }, { signal: controller.signal, rejectOnSendError: true });
     if (decision === "allow" || decision === "deny") {
       return { status: "ok", decision };
     }
-    return { status: "error", message: "Feishu test did not receive a button response" };
+    return { status: "error", code: "no-button-response", message: "Test card did not receive a button response" };
+  } catch (err) {
+    return { status: "error", code: "card-send-failed", message: err && err.message ? err.message : String(err) };
   } finally {
     clearTimeout(timer);
   }
@@ -2467,25 +2945,9 @@ function getTelegramApprovalTokenInfo() {
   };
 }
 
-function buildTelegramApprovalSignature(config, paths, tokenStatus) {
-  return JSON.stringify({
-    enabled: config.enabled === true,
-    allowedTgUserId: config.allowedTgUserId,
-    targetSessionKey: config.targetSessionKey,
-    configPath: paths.configPath,
-    tokenEnvFilePath: paths.tokenEnvFilePath,
-    tokenStored: tokenStatus.tokenStored === true,
-    tokenFileMtimeMs: tokenStatus.tokenFileMtimeMs || 0,
-    tokenRevision: telegramApprovalTokenRevision,
-  });
-}
-
 function getTelegramApprovalStatus() {
   const config = getTelegramApprovalPrefs();
   const token = getTelegramApprovalTokenStatus();
-  const sidecarStatus = telegramApprovalSidecar && typeof telegramApprovalSidecar.getStatus === "function"
-    ? telegramApprovalSidecar.getStatus()
-    : { status: "stopped" };
   const migrationSnapshot = _telegramMigrationController && typeof _telegramMigrationController.getSnapshot === "function"
     ? _telegramMigrationController.getSnapshot()
     : null;
@@ -2495,18 +2957,13 @@ function getTelegramApprovalStatus() {
   return buildTelegramApprovalStatus({
     config,
     token,
-    sidecarStatus,
     migrationSnapshot,
     nativePolling,
   });
 }
 
 function getPendingTelegramApprovalCount() {
-  return pendingPermissions.filter((entry) =>
-    entry
-    && !entry.isCodexNotify
-    && !entry.isKimiNotify
-  ).length;
+  return pendingPermissions.filter((entry) => entry && !isPassiveNotifyEntry(entry)).length;
 }
 
 function getTelegramNativeRunnerStatus() {
@@ -2527,9 +2984,6 @@ function getTelegramNativeRunnerStatus() {
 function buildTelegramStatusCommandText(options = {}) {
   const config = getTelegramApprovalPrefs();
   const token = getTelegramApprovalTokenStatus();
-  const sidecarStatus = telegramApprovalSidecar && typeof telegramApprovalSidecar.getStatus === "function"
-    ? telegramApprovalSidecar.getStatus()
-    : { status: "stopped" };
   const migrationSnapshot = _telegramMigrationController && typeof _telegramMigrationController.getSnapshot === "function"
     ? _telegramMigrationController.getSnapshot()
     : null;
@@ -2538,7 +2992,6 @@ function buildTelegramStatusCommandText(options = {}) {
   const approvalStatus = buildTelegramApprovalStatus({
     config,
     token,
-    sidecarStatus,
     migrationSnapshot,
     nativePolling,
   });
@@ -2568,139 +3021,52 @@ function handleTelegramNativeCommand({ command, args } = {}) {
   return buildTelegramStatusCommandText({ all: true });
 }
 
+function telegramTokenFileDigest(filePath) {
+  try {
+    return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
 function writeTelegramApprovalToken(token) {
   const paths = getTelegramApprovalPaths();
-  const result = telegramApprovalSettings.writeTokenEnvFile({
-    fs,
-    path,
-    filePath: paths.tokenEnvFilePath,
-    token,
-    platform: process.platform,
+  const beforeDigest = telegramTokenFileDigest(paths.tokenEnvFilePath);
+  // Tighten active grants before mutating the credential. The temporary route
+  // also invalidates trust cards issued against the old token even if the
+  // replacement ultimately fails and leaves identical file metadata behind.
+  syncTelegramSessionAutomationRoute({
+    ...getTelegramSessionAutomationRoute(),
+    credentialWritePending: true,
   });
+  let result;
+  try {
+    result = telegramApprovalSettings.writeTokenEnvFile({
+      fs,
+      path,
+      filePath: paths.tokenEnvFilePath,
+      token,
+      platform: process.platform,
+    });
+  } finally {
+    syncTelegramSessionAutomationRoute();
+  }
   if (result && result.status === "ok") {
-    telegramApprovalTokenRevision += 1;
-    queueTelegramApprovalSidecarSync("token");
+    const identityChanged = beforeDigest !== telegramTokenFileDigest(paths.tokenEnvFilePath);
+    if (_telegramMigrationController
+      && typeof _telegramMigrationController.reconcileConfiguration === "function") {
+      void _telegramMigrationController.reconcileConfiguration({ identityChanged });
+    }
   }
   return result;
-}
-
-// Bridge a freshly-created legacy sidecar's status-changed stream into the
-// migration controller. A new bridge per instance keeps everReady/dedupe state
-// scoped to that process; the controller is referenced lazily because it may be
-// created after the first sidecar (init drives the first start).
-function attachTelegramSidecarStatusBridge(sidecar) {
-  if (!sidecar || typeof sidecar.on !== "function") return;
-  const bridge = createTelegramSidecarStatusBridge({
-    getSnapshot: () => (_telegramMigrationController
-      && typeof _telegramMigrationController.getSnapshot === "function"
-      ? _telegramMigrationController.getSnapshot()
-      : null),
-    dispatch: (event) => (_telegramMigrationController
-      && typeof _telegramMigrationController.dispatch === "function"
-      ? _telegramMigrationController.dispatch(event)
-      : Promise.resolve()),
-    log: telegramApprovalLog,
-  });
-  sidecar.on("status-changed", (status) => bridge.onStatusChanged(status));
-}
-
-async function startTelegramApprovalSidecar() {
-  const config = getTelegramApprovalPrefs();
-  const paths = getTelegramApprovalPaths();
-  const token = getTelegramApprovalTokenStatus();
-  const ready = telegramApprovalSettings.readiness(config, token);
-  if (!ready.ready) {
-    if (ready.reason !== "disabled") {
-      telegramApprovalLog("info", ready.reason || "not configured", {
-        error: ready.message || "",
-      });
-    }
-    return false;
-  }
-  const configWrite = telegramApprovalSettings.writeBridgeConfigFile({
-    fs,
-    path,
-    filePath: paths.configPath,
-    config,
-  });
-  if (!configWrite || configWrite.status !== "ok") {
-    telegramApprovalLog("warn", "config write failed", {
-      error: configWrite && configWrite.message,
-    });
-    return false;
-  }
-  const signature = buildTelegramApprovalSignature(config, paths, token);
-  if (telegramApprovalSidecar && telegramApprovalConfigSignature === signature) {
-    const sidecar = telegramApprovalSidecar;
-    if (typeof sidecar.isRunning !== "function" || !sidecar.isRunning()) {
-      try {
-        await sidecar.start();
-        if (telegramApprovalSidecar === sidecar) telegramApprovalLog("info", "running");
-      } catch (err) {
-        telegramApprovalLog("warn", "start failed", {
-          error: err && err.message ? err.message : String(err),
-        });
-        return false;
-      }
-    }
-    return telegramApprovalSidecar === sidecar;
-  }
-  if (telegramApprovalSidecar) await stopTelegramApprovalSidecar();
-  // The bot token only ever lives at userData/telegram-approval.env on disk.
-  // The sidecar reads it from there directly — Clawd's main process must never
-  // pipe a token value through process.env or child env, so there is no
-  // botToken option here and no CLAWD_TG_BOT_TOKEN read from process.env.
-  telegramApprovalSidecar = createTelegramApprovalSidecar({
-    baseEnv: process.env,
-    env: process.env,
-    userDataDir: paths.userDataDir,
-    resourcesPath: process.resourcesPath,
-    isPackaged: app.isPackaged,
-    configPath: paths.configPath,
-    tokenEnvFilePath: paths.tokenEnvFilePath,
-    redactionSecrets: telegramApprovalSettings.redactionSecretsForTelegramApproval(config),
-    log: telegramApprovalLog,
-  });
-  attachTelegramSidecarStatusBridge(telegramApprovalSidecar);
-  telegramApprovalConfigSignature = signature;
-  const sidecar = telegramApprovalSidecar;
-  try {
-    await sidecar.start();
-    if (telegramApprovalSidecar === sidecar) {
-      telegramApprovalLog("info", "running");
-      return true;
-    }
-  } catch (err) {
-    telegramApprovalLog("warn", "start failed", {
-      error: err && err.message ? err.message : String(err),
-    });
-  }
-  return false;
 }
 
 async function initTelegramMigrationController() {
   if (_telegramMigrationController) return _telegramMigrationController;
   const paths = getTelegramApprovalPaths();
 
-  // Sidecar handle: forwards to the existing async start/stop functions so
-  // there is exactly one sidecar lifecycle in the process.
-  const sidecarHandle = {
-    isRunning: () => !!(telegramApprovalSidecar && telegramApprovalSidecar.isRunning && telegramApprovalSidecar.isRunning()),
-    start: async () => {
-      await setTelegramApprovalEnabledForMigration(true);
-      const started = await startTelegramApprovalSidecar();
-      if (!started) {
-        const err = new Error("Telegram approval sidecar did not start");
-        err.code = "SIDECAR_START_FAILED";
-        throw err;
-      }
-      return true;
-    },
-    stop: () => stopTelegramApprovalSidecar(),
-  };
-
-  // Native handle: spike-level real implementation. Token comes from the same
-  // env file the sidecar uses; production transport closes over the token.
+  // Native handle. The token remains in the canonical userData env file;
+  // neither migration state nor Settings snapshots receive its value.
   const { envFileTokenStore } = require("./telegram-token-store");
   const {
     createClipboardFallbackDeliveryAdapter,
@@ -2772,7 +3138,17 @@ async function initTelegramMigrationController() {
     onTextMessage: (payload) => telegramDirectSend && telegramDirectSend.handleTextMessage(payload),
     getLang: () => _settingsController.get("lang") || lang || "en",
     log: telegramApprovalLog,
+    onSessionGrantRevoke: (grantId) =>
+      sessionAutomationCoordinator
+        ? sessionAutomationCoordinator.revokeRemoteGrant({ grantId })
+        : { status: "stale" },
+    onSessionAutomationRouteChange: (client) => {
+      if (sessionAutomationCoordinator) {
+        sessionAutomationCoordinator.onRemoteClientRouteChange(client);
+      }
+    },
   });
+  nativeRunner.syncSessionAutomationRoute(getTelegramSessionAutomationRoute());
   telegramNativeRunner = nativeRunner;
 
   // R1a: completion notifications ride the existing snapshot fanout. The
@@ -2800,66 +3176,32 @@ async function initTelegramMigrationController() {
   });
 
   _telegramMigrationController = createTelegramMigrationController({
-    sidecar: sidecarHandle,
     native: nativeRunner,
     readPrefs: () => readTelegramMigrationPrefsForController(),
     writePrefs: (patch) => persistTelegramMigrationPatch(patch),
     readFiles: () => {
       const cfg = getTelegramApprovalPrefs();
       const tokenInfo = getTelegramApprovalTokenStatus();
-      const hasTokenFile = !!(tokenInfo && tokenInfo.tokenStored);
       const configComplete = hasCompleteTelegramApprovalConfig(cfg, tokenInfo);
       return {
-        hasLegacyEnvFile: hasTokenFile,
-        legacyConfigComplete: configComplete,
         nativeConfigComplete: configComplete,
       };
+    },
+    onSnapshotChanged: ({ revision }) => {
+      syncTelegramSessionAutomationRoute();
+      broadcastSettingsWindow("remoteApproval:status-changed", {
+        channel: "telegram",
+        revision,
+      });
     },
     log: telegramApprovalLog,
   });
 
   await _telegramMigrationController.init();
+  telegramApprovalIdentitySignature = buildTelegramApprovalIdentitySignature(
+    getTelegramApprovalPrefs()
+  );
   return _telegramMigrationController;
-}
-
-function stopTelegramApprovalSidecar() {
-  const sidecar = telegramApprovalSidecar;
-  telegramApprovalSidecar = null;
-  telegramApprovalConfigSignature = "";
-  if (!sidecar || typeof sidecar.stop !== "function") return Promise.resolve();
-  return sidecar.stop().catch((err) => telegramApprovalLog("warn", "stop failed", {
-    error: err && err.message ? err.message : String(err),
-  }));
-}
-
-async function syncTelegramApprovalSidecar(reason = "settings") {
-  if (!isTelegramLegacySidecarSyncAllowed()) {
-    if (telegramApprovalSidecar) await stopTelegramApprovalSidecar();
-    telegramApprovalLog("debug", `sync ${reason} skipped by migration transport`);
-    return false;
-  }
-  const config = getTelegramApprovalPrefs();
-  const paths = getTelegramApprovalPaths();
-  const token = getTelegramApprovalTokenStatus();
-  const ready = telegramApprovalSettings.readiness(config, token);
-  if (!ready.ready) {
-    if (telegramApprovalSidecar) await stopTelegramApprovalSidecar();
-    return false;
-  }
-  const nextSignature = buildTelegramApprovalSignature(config, paths, token);
-  if (telegramApprovalSidecar && telegramApprovalConfigSignature !== nextSignature) {
-    await stopTelegramApprovalSidecar();
-  }
-  const started = await startTelegramApprovalSidecar();
-  if (started) telegramApprovalLog("debug", `sync ${reason}`);
-  return started;
-}
-
-function queueTelegramApprovalSidecarSync(reason) {
-  telegramApprovalSyncPromise = telegramApprovalSyncPromise
-    .catch(() => {})
-    .then(() => syncTelegramApprovalSidecar(reason));
-  return telegramApprovalSyncPromise;
 }
 
 // In-process IPC bridge fed by the session-snapshot subscription.
@@ -2904,16 +3246,13 @@ function telegramApprovalUnavailableMessage(status) {
   if (status && status.reason === "native-inactive") return translate("telegramApprovalNativeInactiveMessage");
   if (status && status.reason === "native-testing") return translate("telegramApprovalNativeTestingMessage");
   if (status && status.transport === "native") return translate("telegramApprovalNativeInactiveMessage");
-  return translate("telegramApprovalSidecarNotRunningMessage");
+  return translate("telegramApprovalNativeInactiveMessage");
 }
 
 async function sendTelegramApprovalTest() {
   const beforeStatus = getTelegramApprovalStatus();
   if (beforeStatus.configured !== true) {
     return { status: "error", message: telegramApprovalUnavailableMessage(beforeStatus) };
-  }
-  if (!(beforeStatus && beforeStatus.transport === "native")) {
-    await queueTelegramApprovalSidecarSync("test");
   }
   const client = getTelegramApprovalClient();
   if (!client || typeof client.requestApproval !== "function") {
@@ -3072,16 +3411,33 @@ const _menuCtx = {
   set hideBubbles(v) { _settingsController.applyCommand("setAllBubblesHidden", { hidden: !!v }).catch((err) => {
     console.warn("Clawd: setAllBubblesHidden failed:", err && err.message);
   }); },
-  get autoApproveAllPermissions() { return _settingsController.get("autoApproveAllPermissions") === true; },
-  // Route through the gated command. The menu shows its own native danger
-  // confirm before setting true, so it passes confirmed:true; disabling needs
-  // no confirmation. applyUpdate is intentionally NOT used — the field is
-  // gated so the confirm dialog is a real boundary, not UI-only.
-  set autoApproveAllPermissions(v) {
-    _settingsController.applyCommand("setAutoApproveAll", { enabled: !!v, confirmed: true }).catch((err) => {
-      console.warn("Clawd: setAutoApproveAll failed:", err && err.message);
+  get permissionAutomationMode() {
+    return _settingsController.get("permissionAutomationMode") || "off";
+  },
+  isPermissionAutomationWarningDismissed(mode) {
+    const key = mode === "auto-tools"
+      ? "permissionAutomationAutoToolsWarningDismissed"
+      : (mode === "unattended"
+        ? "permissionAutomationUnattendedWarningDismissed"
+        : null);
+    return key ? _settingsController.get(key) === true : false;
+  },
+  setPermissionAutomationMode(mode, options = {}) {
+    return _settingsController.applyCommand("setPermissionAutomationMode", {
+      mode,
+      confirmed: options.confirmed === true,
+      suppressFutureConfirmation: options.suppressFutureConfirmation === true,
+    }).catch((err) => {
+      console.warn("Clawd: setPermissionAutomationMode failed:", err && err.message);
+      return { status: "error", message: err && err.message };
     });
   },
+  confirmPermissionAutomation: (payload) => (
+    permissionAutomationConfirmationRuntime.confirmPermissionAutomation(payload)
+  ),
+  showPermissionAutomationError: (payload) => (
+    permissionAutomationConfirmationRuntime.showPermissionAutomationError(payload)
+  ),
   get soundMuted() { return soundMuted; },
   set soundMuted(v) { _settingsController.applyUpdate("soundMuted", v); },
   get soundVolume() { return soundVolume; },
@@ -3222,12 +3578,17 @@ const SETTINGS_MIRROR_SETTERS = {
   sessionHudShowStateLabels: (v) => { sessionHudShowStateLabels = v; },
   sessionHudShowElapsed: (v) => { sessionHudShowElapsed = v; },
   sessionHudShowContextUsage: (v) => { sessionHudShowContextUsage = v; },
+  sessionHudShowQuota: (v) => { sessionHudShowQuota = v; },
+  claudeQuotaCollectionEnabled: (v) => { claudeQuotaCollectionEnabled = v; },
+  quotaMergeSources: (v) => { quotaMergeSources = v; },
   sessionHudCleanupDetached: (v) => { sessionHudCleanupDetached = v; },
   sessionHudPinned: (v) => { sessionHudPinned = v; },
   sessionStaleMs: (v) => { sessionStaleMs = v; }, workingStaleMs: (v) => { workingStaleMs = v; },
   detachedIdleStaleMs: (v) => { detachedIdleStaleMs = v; },
   soundMuted: (v) => { soundMuted = v; }, soundVolume: (v) => { soundVolume = v; }, lowPowerIdleMode: (v) => { lowPowerIdleMode = v; },
   keepAwakeWhileWorking: (v) => { keepAwakeWhileWorking = v; },
+  petTint: (v) => { petTint = v; },
+  petAccessory: (v) => { petAccessory = v; },
   allowEdgePinning: (v) => { allowEdgePinningCached = v; }, disableMiniMode: (v) => { disableMiniModeCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; resetKeepSizeFrozen(); },
   fullscreenOverlay: (v) => { fullscreenOverlayCached = v; },
   freeRoam: (v) => { _roam.setEnabled(v); },
@@ -3256,11 +3617,20 @@ const settingsEffectRouter = createSettingsEffectRouter({
   sendToRenderer,
   sendDashboardI18n: () => sendDashboardI18n(),
   sendSessionHudI18n: () => sendSessionHudI18n(),
+  syncWindowTitles: () => {
+    settingsWindowRuntime.applyTitleToWindow();
+    // syncLocalization pushes BOTH the native title AND fresh renderer state
+    // (dictionary/lang), so an external language change (Settings/tray) keeps
+    // the tutorial body, buttons, and document.title in sync with the new
+    // language — not just the native title bar.
+    _tutorial.syncLocalization();
+  },
   emitSessionSnapshot: (options) => _state.emitSessionSnapshot(options),
   cleanStaleSessions: () => _state.cleanStaleSessions(),
   syncPermissionShortcuts,
   dismissInteractivePermissionBubbles: () => callRuntimeMethod(_perm, "dismissInteractivePermissionBubbles"),
   clearCodexNotifyBubbles,
+  clearCodexUserInputBubbles,
   clearKimiNotifyBubbles,
   refreshPassiveNotifyAutoClose: () => callRuntimeMethod(_perm, "refreshPassiveNotifyAutoClose"),
   refreshPermissionAutoCloseForPolicy: () => callRuntimeMethod(_perm, "refreshPermissionAutoCloseForPolicy"),
@@ -3277,19 +3647,40 @@ const settingsEffectRouter = createSettingsEffectRouter({
   reclampPetAfterEdgePinningChange,
   exitMiniMode: () => exitMiniMode(),
   getMiniMode: () => _mini.getMiniMode(),
+  getActiveTheme: () => getActiveTheme(),
+  // #509: re-rest the pet on the newly selected idle visual right away, but
+  // only while actually idle — task/sleep/mini states pick it up on their
+  // next natural revert instead.
+  refreshIdleVisual: () => {
+    if (_state.getCurrentState() !== "idle") return;
+    _state.applyState("idle", _state.getSvgOverride("idle"));
+  },
   rebuildAllMenus,
   reconcilePowerSaveBlocker,
   logWarn: console.warn,
 });
 settingsEffectRouter.start();
-_settingsController.subscribeKey("tgApproval", () => {
-  if (suppressTelegramApprovalSidecarSync > 0) return;
-  queueTelegramApprovalSidecarSync("settings");
+_settingsController.subscribeKey("tgApproval", (value) => {
+  syncTelegramSessionAutomationRoute();
+  if (suppressTelegramMigrationReconcile > 0) return;
+  const nextSignature = buildTelegramApprovalIdentitySignature(value);
+  const identityChanged = telegramApprovalIdentitySignature !== ""
+    && nextSignature !== telegramApprovalIdentitySignature;
+  telegramApprovalIdentitySignature = nextSignature;
+  if (!identityChanged) return;
+  if (_telegramMigrationController
+    && typeof _telegramMigrationController.reconcileConfiguration === "function") {
+    void _telegramMigrationController.reconcileConfiguration({ identityChanged: true });
+  }
 });
 _settingsController.subscribeKey("discordPresence", () => {
   syncDiscordPresence("settings");
 });
 _settingsController.subscribeKey("feishuApproval", () => {
+  prepareFeishuSessionAutomationRouteChange(buildFeishuSessionAutomationRouteSignature(
+    getFeishuApprovalPrefs(),
+    getFeishuApprovalSecrets()
+  ));
   queueFeishuApprovalSync("settings");
 });
 _settingsController.subscribeKey("mobilePreviewEnabled", async (enabled) => {
@@ -3382,6 +3773,7 @@ try {
 
 // ── Doctor tab IPC ──
 const { registerDoctorIpc } = require("./doctor-ipc");
+let _remoteSshRuntime = null;
 registerDoctorIpc({
   ipcMain,
   app,
@@ -3390,6 +3782,10 @@ registerDoctorIpc({
   getPrefsSnapshot: () => _settingsController.getSnapshot(),
   getDoNotDisturb: () => doNotDisturb,
   getLocale: () => _settingsController.get("lang") || "en",
+  resolveAgentDisplayName: _resolveAgentDisplayName,
+  getRemoteSshStatuses: () => _remoteSshRuntime
+    ? _remoteSshRuntime.listStatuses()
+    : [],
 });
 
 // ── Remote SSH (Phase 2) ──
@@ -3401,8 +3797,9 @@ registerDoctorIpc({
 // any spawned ssh / scp children.
 const { createRemoteSshRuntime } = require("./remote-ssh-runtime");
 const { registerRemoteSshIpc } = require("./remote-ssh-ipc");
-const _remoteSshRuntime = createRemoteSshRuntime({
+_remoteSshRuntime = createRemoteSshRuntime({
   getHookServerPort: () => getHookServerPort(),
+  createProfileIngress: (options) => _server.openRemoteSshIngress(options),
   log: (...args) => console.warn("Clawd remote-ssh:", ...args),
 });
 const _remoteSshIpc = registerRemoteSshIpc({
@@ -3411,6 +3808,8 @@ const _remoteSshIpc = registerRemoteSshIpc({
   remoteSshRuntime: _remoteSshRuntime,
   BrowserWindow,
   isPackaged: app.isPackaged,
+  getInstallationIdentity: () => _remoteSshInstallationIdentity,
+  enableProfileIsolation: process.env.CLAWD_ENABLE_EXPERIMENTAL_REMOTE_ISOLATION === "1",
 });
 
 // ── Settings panel window ──
@@ -3465,6 +3864,7 @@ registerSettingsIpc({
   fs,
   path,
   settingsController: _settingsController,
+  getQuotaSourceCount: () => _state.getQuotaSourceCount(),
   themeLoader,
   codexPetMain,
   getSettingsWindow,
@@ -3484,6 +3884,8 @@ registerSettingsIpc({
   getSoundMuted: () => soundMuted,
   getSoundVolume: () => soundVolume,
   getAllAgents,
+  getHookServerPort: () => getHookServerPort(),
+  getRecentHookEvents: (options) => _server.getRecentHookEvents(options),
   checkForUpdates,
   showTutorial: () => {
     _tutorial.open();
@@ -3499,8 +3901,18 @@ registerSessionIpc({
   getI18n: () => getDashboardI18nPayload(),
   focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
   hideSession: (sessionId) => hideDashboardSession(sessionId),
+  openSessionFolder: (sessionId) => openDashboardSessionFolder(sessionId),
   ackSessionCompletion: (sessionId) => _state.ackSessionCompletion(sessionId),
   setSessionAlias: (payload) => _settingsController.applyCommand("setSessionAlias", payload),
+  setSessionAutomationOverride: (payload, context) => {
+    let warningParent = null;
+    try {
+      warningParent = BrowserWindow.fromWebContents(context && context.sender);
+    } catch {}
+    return sessionAutomationCoordinator.setSessionAutomationOverride(payload, { warningParent });
+  },
+  clearSessionAutomationGrant: (payload) =>
+    sessionAutomationCoordinator.clearSessionAutomationGrant(payload),
   showDashboard: (options) => showDashboard(options),
   setSessionHudPinned: (value) => {
     const result = _settingsController.applyUpdate("sessionHudPinned", !!value);
@@ -3573,7 +3985,7 @@ function createWindow() {
     initialVirtualBounds,
     preloadPath: path.join(__dirname, "preload.js"),
     loadFilePath: path.join(__dirname, "index.html"),
-    themeConfig: themeRuntime.getRendererConfig(),
+    themeConfig: buildRendererThemeConfig(),
     setRenderWindow: (createdWindow) => { win = createdWindow; },
     isQuitting: () => isQuitting,
     applyDockVisibility,
@@ -3607,9 +4019,19 @@ function createWindow() {
 
   focusHud.create();
 
-  // Event-level safety net for position sync
-  win.on("move", () => petWindowRuntime.syncFloatingWindowsAfterPetBoundsChange());
-  win.on("resize", () => petWindowRuntime.syncFloatingWindowsAfterPetBoundsChange());
+  // Issue #690 plan §4.3.9: these replace (not supplement) the previous
+  // synchronous "move"/"resize" -> syncFloatingWindowsAfterPetBoundsChange()
+  // wiring. Native move/resize callbacks carry no geometry and must not
+  // read/write anything themselves — onNativeGeometryEvent() only
+  // (re)schedules a debounced quiet-point reconcile, which is what now calls
+  // syncFloatingWindowsAfterPetBoundsChange() (as syncDerivedSurfaces()) once
+  // it has classified the settled geometry.
+  win.on("move", () => petWindowRuntime.onNativeGeometryEvent());
+  win.on("resize", () => petWindowRuntime.onNativeGeometryEvent());
+  // §4.3.11: the hit window gets the same geometry-blind debounced treatment,
+  // on its own (longer) HIT_QUIET_MS quiet period.
+  hitWin.on("move", () => petWindowRuntime.onHitNativeGeometryEvent());
+  hitWin.on("resize", () => petWindowRuntime.onHitNativeGeometryEvent());
 
   syncSessionHudVisibility();
 
@@ -3623,11 +4045,19 @@ function createWindow() {
     getCurrentState: () => _state.getCurrentState(),
     getCurrentSvg: () => _state.getCurrentSvg(),
     sendToRenderer,
+    recoverVisiblePetAfterRendererLoad: (event) => {
+      if (!win || win.isDestroyed()) return;
+      if (!event || event.sender !== win.webContents) return;
+      if (themeRuntime.isReloadInProgress()) return;
+      petWindowRuntime.recoverVisiblePetAfterRendererLoad();
+    },
     setDragLocked: (value) => { petWindowRuntime.setDragLocked(value); },
     setMouseOverPet: (value) => { mouseOverPet = !!value; },
+    cancelRoam: () => _roam.cancelRoam(),
     beginDragSnapshot: () => beginDragSnapshot(),
     clearDragSnapshot: () => clearDragSnapshot(),
     syncHitWin: () => syncHitWin(),
+    syncImeEditingPetDodge: () => topmostRuntime.syncImeEditingPetDodge(),
     isMiniMode: () => _mini.getMiniMode(),
     checkMiniModeSnap: () => checkMiniModeSnap(),
     getDisableMiniMode: () => disableMiniModeCached,
@@ -3681,6 +4111,24 @@ function createWindow() {
   // never block startup.
   startHttpServer().then((port) => {
     if (port == null) return;
+    const restoredSessionIds = restoreSessionsFromRecoveryLeases(_state, {
+      isAgentEnabled: (agentId) => {
+        const snapshot = { agents: _settingsController.get("agents") };
+        return _isAgentEnabled(snapshot, agentId)
+          && _isAgentIntegrationInstalled(snapshot, agentId);
+      },
+    });
+    if (restoredSessionIds.length > 0) {
+      const recoveredSnapshot = _state.buildSessionSnapshot();
+      reconcilePowerSaveBlocker();
+      broadcastDashboardSessionSnapshot(recoveredSnapshot);
+      broadcastSessionHudSnapshot(recoveredSnapshot);
+      if (!doNotDisturb && !_mini.getMiniMode()) {
+        const recoveredState = resolveDisplayState();
+        applyState(recoveredState, getSvgOverride(recoveredState));
+      }
+      sessionLog(`startup recovery restored sessions=${restoredSessionIds.join(",")}`);
+    }
     try { _remoteSshIpc.connectOnLaunchProfiles(); } catch {}
   }).catch(() => {});
   if (_settingsController.get("mobilePreviewEnabled") === true) _lanWss.start();
@@ -3692,8 +4140,8 @@ function createWindow() {
     setLowPowerIdlePaused(false);
   });
   win.webContents.on("did-finish-load", () => {
-    sendToRenderer("theme-config", themeRuntime.getRendererConfig());
-    sendToRenderer("viewport-offset", petWindowRuntime.getViewportOffsetY());
+    sendToRenderer("theme-config", buildRendererThemeConfig());
+    petWindowRuntime.resendViewportOffsets();
     if (themeRuntime.isReloadInProgress()) return;
     syncRendererStateAfterLoad();
   });
@@ -3726,7 +4174,29 @@ function createWindow() {
       petWindowRuntime.handleDisplayMetricsChanged();
     }, 400);
   };
-  screen.on("display-metrics-changed", reapplyDisplayGeometryAfterMetricsChange);
+  // PR #751 second-review C-6 (Codex non-blocking): §4.3.14's
+  // observedClampInset is only valid until the topology it was learned
+  // against changes — clearing it (and invalidating the displays cache,
+  // B-5) used to wait for the SAME 400ms debounce as the geometry reflow
+  // above, so a burst of metrics events could keep re-arming the debounce
+  // and delay the clear indefinitely while stale insets kept getting used
+  // for clamp classification in the meantime. Both now run immediately, in
+  // the raw event callback, decoupled from the (still debounced, to avoid
+  // visible jitter) geometry reflow itself. Clearing the whole table here
+  // is a safe superset of "clear the affected display's entries" —
+  // Electron doesn't cheaply say WHICH display changed from this event
+  // alone.
+  screen.on("display-metrics-changed", () => {
+    petWindowRuntime.clearObservedClampInsets();
+    petWindowRuntime.invalidateDisplaysCache();
+    reapplyDisplayGeometryAfterMetricsChange();
+  });
+  // PR #751 second-review C-4 (Codex B4): display-removed/added now also
+  // clear the inset table (handleDisplayRemoved()/handleDisplayAdded()
+  // themselves do this now, as their own first lines alongside their
+  // existing invalidateDisplaysCache() call) — previously only
+  // metrics-changed did, leaving a stale inset alive across a monitor
+  // unplug/replug or a genuine topology addition.
   screen.on("display-removed", () => petWindowRuntime.handleDisplayRemoved());
   screen.on("display-added", () => petWindowRuntime.handleDisplayAdded());
 
@@ -3796,6 +4266,9 @@ const _miniCtx = {
   applyPetWindowBounds,
   applyPetWindowPosition,
   setViewportOffsetY,
+  // Issue #690 plan §4.3.10's mini transition+animation reconcile protection
+  // period release point (mirrors _roamCtx's identical wiring below).
+  releaseReconcileProtection: () => petWindowRuntime.releaseReconcileProtection(),
   get bubbleFollowPet() { return bubbleFollowPet; },
   get pendingPermissions() { return pendingPermissions; },
   repositionBubbles: () => repositionFloatingBubbles(),
@@ -3820,11 +4293,14 @@ const { enterMiniMode, exitMiniMode, enterMiniViaMenu, miniPeekIn, miniPeekOut,
 // ── Free Roam — initialized here after state and mini modules ──
 const _roamCtx = {
   get win() { return win; },
+  get dragLocked() { return petWindowRuntime.isDragLocked(); },
   getPetWindowBounds,
   applyPetWindowBounds,
   // #569: lets roam anchor to the keep-size frozen size when that toggle is on
   getEffectiveCurrentPixelSize,
   syncHitWin: () => syncHitWin(),
+  // Issue #690 plan §4.3.10's roam protection-period release point.
+  releaseReconcileProtection: () => petWindowRuntime.releaseReconcileProtection(),
   repositionSessionHud: () => repositionSessionHud(),
   repositionAnchoredSurfaces: () => repositionAnchoredFloatingSurfaces(),
   repositionBubbles: () => repositionFloatingBubbles(),
@@ -3838,6 +4314,10 @@ const _roamCtx = {
   applyState: (state, svgOverride, opts) => _state.applyState(state, svgOverride, opts),
   setState: (state, svgOverride, opts) => _state.setState(state, svgOverride, opts),
   setRoamHeading: (headingLeft) => sendToRenderer("roam-heading", !!headingLeft),
+  // #640: hold still while the user types into a bubble text field (macOS)
+  isImeEditingActive: () => pendingPermissions.some(
+    (p) => p && p.bubble && !p.bubble.isDestroyed() && p.bubble.__clawdMacImeEditing
+  ),
 };
 const _roam = require("./roam")(_roamCtx);
 
@@ -3923,6 +4403,18 @@ if (!gotTheLock) {
   // Another instance is already running — quit silently
   app.quit();
 } else {
+  // Only the winning instance may publish the startup gate. A losing instance
+  // can have a stale/default prefs snapshot and must never become the final
+  // writer after the active instance has disabled Codex.
+  // A future-version or recovered snapshot is not authoritative enough to
+  // publish an enabled external gate. Fail closed until a valid prefs commit
+  // reaches the post-commit agents subscriber above.
+  const startupGateSnapshot = (
+    _initialPrefsLoad.locked === true
+    || _initialPrefsLoad.recovered === true
+    || _initialPrefsLoad.codexAutoStartAuthoritative === false
+  ) ? null : _initialPrefsLoad.snapshot;
+  _syncCodexAutoStartGate(startupGateSnapshot, "startup");
   app.on("second-instance", (_event, commandLine) => {
     if (petWindowRuntime.isPetHidden()) {
       prepManualPetVisibility();
@@ -3936,6 +4428,10 @@ if (!gotTheLock) {
         hitWin.showInactive();
         keepOutOfTaskbar(hitWin);
       }
+      // #525: relaunching while the pet is nominally visible is a "where is my
+      // pet?" signal — showInactive() alone cannot clear a DWM cloak, so run
+      // the cloak recovery path too.
+      petWindowRuntime.recoverIfCloaked();
     }
     if (shouldOpenSettingsWindowFromArgv(commandLine)) {
       settingsWindowRuntime.openWhenReady();
@@ -3997,7 +4493,7 @@ if (!gotTheLock) {
     }
   }
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     // macOS: override the dock icon with a version padded to the macOS icon
     // grid (~80.5% of the canvas, ~100px transparent margin per side) so the
     // Dock tile matches neighbor apps. The build-time icon.png sits ~72.6%
@@ -4025,6 +4521,12 @@ if (!gotTheLock) {
     // First-run only: seed UI language from the device locale, before createWindow
     // so the very first menu/tray render is already in the user's language.
     hydrateFreshInstallLanguage();
+    try {
+      await initializeRemoteSshInstallationIdentity();
+    } catch (err) {
+      _remoteSshInstallationIdentity = null;
+      console.error("Clawd remote-ssh: installation identity initialization failed:", err && err.message);
+    }
 
     permDebugLog = path.join(app.getPath("userData"), "permission-debug.log");
     updateDebugLog = path.join(app.getPath("userData"), "update-debug.log");
@@ -4058,6 +4560,16 @@ if (!gotTheLock) {
       ),
     });
     systemWakeRecovery.start();
+    // #525: sleep/wake and lock/unlock are prime DWM-cloak moments. Hang the
+    // cloak recovery directly on powerMonitor rather than onRecovered above:
+    // onRecovered only fires after a renderer round-trip and is skipped on
+    // timeout (system-wake-recovery.js finishWithTimeout), while un-cloaking is
+    // a main-process concern that must not depend on renderer health. The two
+    // paths coexist; recoverIfCloaked() is a no-op when nothing is cloaked.
+    if (isWin) {
+      powerMonitor.on("resume", () => petWindowRuntime.recoverIfCloaked());
+      powerMonitor.on("unlock-screen", () => petWindowRuntime.recoverIfCloaked());
+    }
     // macOS: bridge the OS app-hidden state (⌘H / Dock right-click → 隐藏) to the
     // pet. Pet windows are setCanHide:NO, so the OS marks the app hidden but the
     // windows refuse to vanish, and an inactive-app Dock Hide fires no
@@ -4123,12 +4635,19 @@ if (!gotTheLock) {
   app.on("before-quit", () => {
     isQuitting = true;
     if (systemWakeRecovery) systemWakeRecovery.dispose();
+    // #525: release the IVirtualDesktopManager COM ref and pay back our own
+    // CoInitializeEx count (see win-cloak-recovery.js dispose()).
+    _cloakInspector.dispose();
     try { stopUpdateScheduler(); } catch {}
     releasePowerSaveBlocker();
     flushRuntimeStateToPrefs();
     globalShortcut.unregisterAll();
     void settingsSizePreviewSession.cleanup();
-    stopTelegramApprovalSidecar();
+    permissionAutomationConfirmationRuntime.dispose();
+    if (_telegramMigrationController
+      && typeof _telegramMigrationController.dispose === "function") {
+      void _telegramMigrationController.dispose();
+    }
     if (discordPresenceBridge) discordPresenceBridge.stop();
     stopFeishuApprovalClient();
     _perm.cleanup();

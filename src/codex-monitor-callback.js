@@ -1,8 +1,12 @@
 "use strict";
 
+const { normalizeQuotaGroup } = require("../hooks/quota-bucket");
+const { CODEX_QUOTA_FIELDS } = require("../hooks/codex-rate-limits");
+
 function isCodexMonitorMetadataOnlyEvent(event, extra) {
   return event === "event_msg:token_count"
-    && !!(extra && typeof extra === "object" && extra.contextUsage);
+    && !!(extra && typeof extra === "object"
+      && (extra.contextUsage || extra.codexQuota || extra.codexSparkQuota));
 }
 
 function normalizeContextUsage(value) {
@@ -22,7 +26,10 @@ function normalizeContextUsage(value) {
   return out;
 }
 
-function buildCodexMonitorUpdateOptions(extra, options = {}) {
+// Session metadata and account quota deliberately have separate builders.
+// This makes it structurally impossible for any updateSession caller (including
+// passive user-input paths) to spread account quota into session options.
+function buildCodexMonitorSessionOptions(extra, options = {}) {
   const input = extra && typeof extra === "object" ? extra : {};
   const out = {
     cwd: input.cwd,
@@ -40,7 +47,18 @@ function buildCodexMonitorUpdateOptions(extra, options = {}) {
   return out;
 }
 
+function normalizeCodexMonitorAccountQuotas(extra) {
+  const input = extra && typeof extra === "object" ? extra : {};
+  const out = {};
+  const codexQuota = normalizeQuotaGroup(input.codexQuota, CODEX_QUOTA_FIELDS);
+  if (codexQuota) out.codexQuota = codexQuota;
+  const codexSparkQuota = normalizeQuotaGroup(input.codexSparkQuota, CODEX_QUOTA_FIELDS);
+  if (codexSparkQuota) out.codexSparkQuota = codexSparkQuota;
+  return Object.keys(out).length ? out : null;
+}
+
 module.exports = {
-  buildCodexMonitorUpdateOptions,
+  buildCodexMonitorSessionOptions,
+  normalizeCodexMonitorAccountQuotas,
   isCodexMonitorMetadataOnlyEvent,
 };

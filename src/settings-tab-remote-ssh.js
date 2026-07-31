@@ -22,9 +22,8 @@
   //
   // progressLog is a Map<profileId, Array<event>> so concurrent deploys on
   // multiple profiles each get their own log; the detail panel renders only
-  // the slice belonging to its profile. deployingProfileIds is a Set so the
-  // Deploy button on each card knows independently whether THAT profile is
-  // mid-deploy (one profile finishing must not unblock another's button).
+  // the slice belonging to its profile. The per-profile in-flight Sets keep
+  // destructive/action buttons disabled across status/progress rerenders.
   const view = {
     selectedProfileId: null,
     editing: null,        // profile snapshot for edit form, or null
@@ -32,6 +31,9 @@
     progressLog: new Map(),     // profileId → Array<event>
     listenerInstalled: false,
     deployingProfileIds: new Set(),
+    deletingProfileIds: new Set(),
+    bindingSecurity: null,
+    profileIsolationAvailable: false,
   };
 
   const PROGRESS_LOG_MAX = 50;
@@ -90,6 +92,8 @@
       window.remoteSsh.listStatuses().then((res) => {
         if (res && res.status === "ok" && Array.isArray(res.statuses)) {
           for (const s of res.statuses) view.runtimeStatuses.set(s.profileId, s);
+          view.bindingSecurity = res.bindingSecurity || null;
+          view.profileIsolationAvailable = res.profileIsolationAvailable === true;
           if (state.activeTab === "remote-ssh") ops.requestRender({ content: true });
         }
       }).catch(() => {});
@@ -168,6 +172,14 @@
     subtitle.textContent = t("remoteSshSubtitle");
     parent.appendChild(subtitle);
 
+    if (view.bindingSecurity && view.bindingSecurity.strongStorage !== true) {
+      const bindingWarning = document.createElement("p");
+      bindingWarning.className = "subtitle remote-ssh-warning";
+      bindingWarning.textContent = t("remoteSshWeakBindingWarning")
+        .replace("{backend}", view.bindingSecurity.storageBackend || "unknown");
+      parent.appendChild(bindingWarning);
+    }
+
     if (view.editing) {
       renderEditForm(parent);
       return;
@@ -204,6 +216,7 @@
         remoteForwardPort: 23333,
         hostPrefix: "",
         autoStartCodexMonitor: false,
+        chainStatusline: false,
         connectOnLaunch: false,
         _isNew: true,
       };
@@ -312,21 +325,41 @@
     const deleteBtn = document.createElement("button");
     deleteBtn.className = "soft-btn remote-ssh-btn-danger";
     deleteBtn.textContent = t("remoteSshDelete");
-    deleteBtn.addEventListener("click", () => {
+    deleteBtn.disabled = view.deletingProfileIds.has(profile.id);
+    deleteBtn.addEventListener("click", async () => {
+      if (view.deletingProfileIds.has(profile.id)) return;
       if (!confirm(t("remoteSshDeleteConfirm").replace("{label}", profile.label))) return;
-      if (window.remoteSsh) {
-        window.remoteSsh.disconnect(profile.id);
-      }
-      callCommand("remoteSsh.delete", profile.id).then((r) => {
-        if (r && r.status === "ok") {
-          if (view.selectedProfileId === profile.id) view.selectedProfileId = null;
-          // Drop deleted profile's view-state buckets so a future profile
-          // reusing the id doesn't inherit stale logs / deploying flag.
-          view.progressLog.delete(profile.id);
-          view.deployingProfileIds.delete(profile.id);
-          ops.requestRender({ content: true });
+      view.deletingProfileIds.add(profile.id);
+      try {
+        ops.requestRender({ content: true });
+        let cleanupSucceeded = true;
+        if (window.remoteSsh) {
+          if (typeof window.remoteSsh.cleanup === "function") {
+            try {
+              const cleanup = await window.remoteSsh.cleanup(profile.id);
+              cleanupSucceeded = !!(cleanup && cleanup.status === "ok" && cleanup.uninstalled !== false);
+            } catch {
+              cleanupSucceeded = false;
+            }
+          } else {
+            window.remoteSsh.disconnect(profile.id);
+          }
         }
-      });
+        if (!cleanupSucceeded && !confirm(t("remoteSshDeleteCleanupFailedConfirm"))) return;
+        const r = await callCommand("remoteSsh.delete", profile.id);
+        if (!r || r.status !== "ok") return;
+        if (view.selectedProfileId === profile.id) view.selectedProfileId = null;
+        // Drop deleted profile's view-state buckets so a future profile
+        // reusing the id doesn't inherit stale logs / in-flight flags.
+        view.progressLog.delete(profile.id);
+        view.deployingProfileIds.delete(profile.id);
+      } finally {
+        // The original button may have been detached by a runtime status
+        // update while cleanup awaited SSH. Keep the source of truth in view
+        // state and rebuild so the currently-mounted button reflects it.
+        view.deletingProfileIds.delete(profile.id);
+        ops.requestRender({ content: true });
+      }
     });
     header.appendChild(deleteBtn);
 
@@ -375,6 +408,112 @@
     hooksRow.appendChild(hooksValue);
     section.appendChild(hooksRow);
 
+    const runtimeRow = document.createElement("div");
+    runtimeRow.className = "remote-ssh-hooks-row";
+    const runtimeLabel = document.createElement("span");
+    runtimeLabel.className = "remote-ssh-hooks-label";
+    runtimeLabel.textContent = t("remoteSshRuntimeModeLabel");
+    runtimeRow.appendChild(runtimeLabel);
+    const isolated = profile.runtimeMode === "profile-isolated";
+    const runtimeValue = document.createElement("span");
+    runtimeValue.className = "remote-ssh-hooks-value";
+    runtimeValue.textContent = isolated
+      ? t(profile.isolatedActive ? "remoteSshIsolatedActive" : "remoteSshIsolatedPrepared")
+      : t("remoteSshAccountDefault");
+    runtimeRow.appendChild(runtimeValue);
+    if (isolated || view.profileIsolationAvailable) {
+      const modeButton = document.createElement("button");
+      modeButton.className = "soft-btn";
+      modeButton.textContent = t(isolated ? "remoteSshDisableIsolation" : "remoteSshEnableIsolation");
+      modeButton.addEventListener("click", async () => {
+        if (!window.remoteSsh || typeof window.remoteSsh.setRuntimeMode !== "function") return;
+        const prompt = t(isolated ? "remoteSshDisableIsolationConfirm" : "remoteSshEnableIsolationConfirm");
+        if (!confirm(prompt)) return;
+        modeButton.disabled = true;
+        const target = isolated ? "account-default" : "profile-isolated";
+        try {
+          const result = await window.remoteSsh.setRuntimeMode(profile.id, target, true);
+          if (!result || result.status !== "ok") {
+            ops.showToast((result && result.message) || "runtime mode switch failed", { error: true, ttl: 10000 });
+          } else {
+            ops.showToast(t("remoteSshRuntimeModeChanged"));
+          }
+        } catch (err) {
+          ops.showToast((err && err.message) || "runtime mode switch failed", { error: true });
+        } finally {
+          ops.requestRender({ content: true });
+        }
+      });
+      runtimeRow.appendChild(modeButton);
+    }
+    section.appendChild(runtimeRow);
+
+    if (isolated) {
+      const boundary = document.createElement("div");
+      boundary.className = "remote-ssh-field-hint";
+      boundary.textContent = t("remoteSshIsolationBoundary");
+      section.appendChild(boundary);
+      const isolatedRuntime = profile.isolatedRuntime;
+      if (isolatedRuntime && isolatedRuntime.runtimeRoot) {
+        const root = document.createElement("div");
+        root.className = "remote-ssh-field-hint";
+        root.textContent = `${t("remoteSshRuntimeRoot")}: ${isolatedRuntime.runtimeRoot}`;
+        section.appendChild(root);
+        const wrappers = document.createElement("div");
+        wrappers.className = "remote-ssh-actions";
+        for (const name of ["claude", "codex", "copilot"]) {
+          const capability = isolatedRuntime.capabilities && isolatedRuntime.capabilities[name];
+          if (!capability || !capability.present || !capability.wrapperPath) continue;
+          const copy = document.createElement("button");
+          copy.className = "soft-btn";
+          copy.textContent = t("remoteSshCopyWrapper").replace("{name}", name);
+          copy.addEventListener("click", async () => {
+            try {
+              await navigator.clipboard.writeText(capability.wrapperPath);
+              ops.showToast(t("remoteSshWrapperCopied"));
+            } catch (err) {
+              ops.showToast((err && err.message) || "copy failed", { error: true });
+            }
+          });
+          wrappers.appendChild(copy);
+        }
+        section.appendChild(wrappers);
+      }
+    }
+
+    if ((profile.identityTxn && profile.identityTxn.phase !== "committed")
+      || typeof profile.previousNonce === "string") {
+      const revokeActions = document.createElement("div");
+      revokeActions.className = "remote-ssh-actions";
+      const addRevokeButton = (mode, labelKey, firstConfirmKey) => {
+        const button = document.createElement("button");
+        button.className = "soft-btn remote-ssh-btn-danger";
+        button.textContent = t(labelKey);
+        button.addEventListener("click", async () => {
+          if (!window.remoteSsh || typeof window.remoteSsh.forceRevoke !== "function") return;
+          if (!confirm(t(firstConfirmKey))) return;
+          if (!confirm(t("remoteSshForceRevokeSecondConfirm"))) return;
+          button.disabled = true;
+          try {
+            const result = await window.remoteSsh.forceRevoke(profile.id, mode, true);
+            if (!result || result.status !== "ok") {
+              ops.showToast((result && result.message) || "identity revocation failed", { error: true, ttl: 10000 });
+            } else {
+              ops.showToast(t("remoteSshForceRevokeSuccess"));
+            }
+          } catch (err) {
+            ops.showToast((err && err.message) || "identity revocation failed", { error: true });
+          } finally {
+            ops.requestRender({ content: true });
+          }
+        });
+        revokeActions.appendChild(button);
+      };
+      addRevokeButton("old", "remoteSshForceRevokeOld", "remoteSshForceRevokeOldConfirm");
+      addRevokeButton("all", "remoteSshForceRevokeAll", "remoteSshForceRevokeAllConfirm");
+      section.appendChild(revokeActions);
+    }
+
     // Action buttons
     const actions = document.createElement("div");
     actions.className = "remote-ssh-actions";
@@ -412,7 +551,17 @@
       // Clear ONLY this profile's log; other profiles mid-deploy keep theirs.
       view.progressLog.set(profile.id, []);
       ops.requestRender({ content: true });
-      window.remoteSsh.deploy(profile.id)
+      const runDeploy = (options) => window.remoteSsh.deploy(profile.id, options);
+      runDeploy()
+        .then((r) => {
+          if (r
+            && r.status !== "ok"
+            && r.reason === "legacy_deployment_confirmation_required"
+            && window.confirm(t("remoteSshLegacyMigrationConfirm"))) {
+            return runDeploy({ legacyMigrationConfirmed: true });
+          }
+          return r;
+        })
         .then((r) => {
           if (r && r.status === "ok") {
             if (r.warning === "target_drift") {
@@ -423,14 +572,6 @@
               const driftedField = r.driftedField || "target";
               ops.showToast(
                 `${t("remoteSshDeployDriftWarning")} (${driftedField})`,
-                { ttl: 10000, error: true }
-              );
-            } else if (r.warning === "stamp_failed") {
-              // Deploy itself ran but lastDeployedAt couldn't be persisted
-              // (validator/persist error). Show as error so the user knows
-              // the "deployed" timestamp on the card is stale.
-              ops.showToast(
-                `${t("remoteSshDeploySuccess")} (${r.message || "stamp failed"})`,
                 { ttl: 10000, error: true }
               );
             } else {
@@ -590,6 +731,7 @@
       hint: t("remoteSshFieldHostPrefixHint"),
     }));
     section.appendChild(checkbox("remoteSshFieldAutoStartCodex", "autoStartCodexMonitor"));
+    section.appendChild(checkbox("remoteSshFieldChainStatusline", "chainStatusline"));
     section.appendChild(checkbox("remoteSshFieldConnectOnLaunch", "connectOnLaunch"));
 
     // Submit / cancel
@@ -616,6 +758,7 @@
         host: (formData.host || "").trim(),
         remoteForwardPort: formData.remoteForwardPort,
         autoStartCodexMonitor: !!formData.autoStartCodexMonitor,
+        chainStatusline: !!formData.chainStatusline,
         connectOnLaunch: !!formData.connectOnLaunch,
         createdAt: formData.createdAt,
       };

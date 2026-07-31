@@ -61,6 +61,8 @@ function registerDoctorIpc({
   getPrefsSnapshot,
   getDoNotDisturb,
   getLocale,
+  resolveAgentDisplayName,
+  getRemoteSshStatuses,
 }) {
   let lastDoctorResult = null;
   let lastDoctorConnectionTest = null;
@@ -70,6 +72,7 @@ function registerDoctorIpc({
       server,
       durationMs: payload && payload.durationMs,
       homeDir: os.homedir(),
+      resolveAgentDisplayName,
     }),
     {
       onResult: (result) => {
@@ -83,6 +86,7 @@ function registerDoctorIpc({
       server,
       prefs: getPrefsSnapshot(),
       doNotDisturb: getDoNotDisturb(),
+      getRemoteSshStatuses,
     });
     return lastDoctorResult;
   }

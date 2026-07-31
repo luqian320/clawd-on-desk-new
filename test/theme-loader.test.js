@@ -890,6 +890,8 @@ describe("theme-loader capability metadata", () => {
       idleMode: "tracked",
       sleepMode: "full",
       powerProfile: "standard",
+      petTint: false,
+      accessories: false,
     });
   });
 
@@ -905,6 +907,8 @@ describe("theme-loader capability metadata", () => {
       idleMode: "tracked",
       sleepMode: "full",
       powerProfile: "standard",
+      petTint: false,
+      accessories: false,
     });
 
     const listed = themeLoader.listThemesWithMetadata().find((theme) => theme.id === "capTheme");

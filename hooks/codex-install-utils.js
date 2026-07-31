@@ -1,7 +1,12 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { resolveNodeBin } = require("./server-config");
+const crypto = require("crypto");
+const {
+  APPIMAGE_HOOK_MARKER_FILE,
+  CODEX_WSL_INTEROP_ARG,
+  resolveNodeBin,
+} = require("./server-config");
 const {
   readJsonFile,
   writeJsonAtomic,
@@ -12,9 +17,12 @@ const {
   formatNodeHookCommand,
 } = require("./json-utils");
 
-const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".codex");
-const DEFAULT_CONFIG_PATH = path.join(DEFAULT_PARENT_DIR, "hooks.json");
-const DEFAULT_FEATURES_CONFIG = path.join(DEFAULT_PARENT_DIR, "config.toml");
+function resolveCodexHome(options = {}) {
+  if (typeof options.codexDir === "string" && options.codexDir.trim()) return options.codexDir.trim();
+  const env = options.env || process.env;
+  if (typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim()) return env.CODEX_HOME.trim();
+  return path.join(options.homeDir || os.homedir(), ".codex");
+}
 
 const CODEX_HOOK_EVENTS = [
   "SessionStart",
@@ -32,8 +40,7 @@ function timeoutForCodexEvent(event) {
 }
 
 function getCodexPaths(options = {}) {
-  const homeDir = options.homeDir || os.homedir();
-  const codexDir = options.codexDir || path.join(homeDir, ".codex");
+  const codexDir = resolveCodexHome(options);
   return {
     codexDir,
     hooksPath: options.hooksPath || path.join(codexDir, "hooks.json"),
@@ -77,7 +84,118 @@ function buildCodexHookPosixInteropCommand(nodeBin, hookScript) {
     || (/^[\\/]{2}/.test(String(nodeBin))
       ? "node.exe"
       : (/\.exe$/i.test(String(nodeBin)) ? nodeBin : `${nodeBin}.exe`));
-  return formatNodeHookCommand(posixNodeBin, hookScript, { platform: "linux" });
+  return `${formatNodeHookCommand(posixNodeBin, hookScript, { platform: "linux" })} ${CODEX_WSL_INTEROP_ARG}`;
+}
+
+function collectRelativeHookClosure(entryPath, options = {}) {
+  const fsApi = options.fs || fs;
+  const resolvedEntry = path.resolve(entryPath);
+  const rootDir = path.dirname(resolvedEntry);
+  const extraEntryPaths = Array.isArray(options.extraEntryPaths)
+    ? options.extraEntryPaths.map((value) => path.resolve(value))
+    : [];
+  const pending = [resolvedEntry, ...extraEntryPaths];
+  const files = new Map();
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (files.has(current)) continue;
+    const relative = path.relative(rootDir, current);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`AppImage hook dependency escaped hooks directory: ${current}`);
+    }
+    const content = fsApi.readFileSync(current);
+    files.set(current, content);
+    const source = content.toString("utf8");
+    for (const match of source.matchAll(/require\(["'](\.\/[^"']+)["']\)/g)) {
+      const resolved = path.resolve(path.dirname(current), match[1]);
+      const candidate = path.extname(resolved) ? resolved : `${resolved}.js`;
+      const dependencyRelative = path.relative(rootDir, candidate);
+      if (dependencyRelative.startsWith("..") || path.isAbsolute(dependencyRelative)) {
+        throw new Error(`AppImage hook dependency escaped hooks directory: ${match[1]}`);
+      }
+      pending.push(candidate);
+    }
+  }
+  return { rootDir, files };
+}
+
+function materializeAppImageHookScript(entryPath, options = {}) {
+  const fsApi = options.fs || fs;
+  const appImagePath = String(options.appImagePath || "").trim();
+  if (!path.isAbsolute(appImagePath)) {
+    throw new Error("AppImage hook installation requires an absolute APPIMAGE path");
+  }
+
+  const resolvedEntry = path.resolve(entryPath);
+  const { rootDir, files } = collectRelativeHookClosure(resolvedEntry, {
+    fs: fsApi,
+    extraEntryPaths: options.extraEntryPaths,
+  });
+  const ordered = [...files.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const hasher = crypto.createHash("sha256");
+  hasher.update(`${appImagePath}\0`);
+  for (const [filePath, content] of ordered) {
+    hasher.update(`${path.relative(rootDir, filePath)}\0`);
+    hasher.update(content);
+    hasher.update("\0");
+  }
+
+  const materializedRoot = options.materializedRoot
+    || path.join(options.homeDir || os.homedir(), ".clawd", "appimage-hooks");
+  const versionDir = path.join(materializedRoot, hasher.digest("hex").slice(0, 20));
+  const targetEntry = path.join(versionDir, path.relative(rootDir, resolvedEntry));
+  const markerPath = path.join(versionDir, APPIMAGE_HOOK_MARKER_FILE);
+  const isComplete = () => {
+    try {
+      if (String(fsApi.readFileSync(markerPath, "utf8")).trim() !== appImagePath) return false;
+      return ordered.every(([filePath]) =>
+        fsApi.existsSync(path.join(versionDir, path.relative(rootDir, filePath))));
+    } catch {
+      return false;
+    }
+  };
+  if (isComplete()) return targetEntry;
+
+  fsApi.mkdirSync(materializedRoot, { recursive: true, mode: 0o700 });
+  const stagingDir = `${versionDir}.tmp-${process.pid}-${Date.now()}`;
+  let replacedDir = null;
+  try {
+    fsApi.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
+    for (const [filePath, content] of ordered) {
+      const target = path.join(stagingDir, path.relative(rootDir, filePath));
+      fsApi.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      fsApi.writeFileSync(target, content);
+    }
+    fsApi.writeFileSync(
+      path.join(stagingDir, APPIMAGE_HOOK_MARKER_FILE),
+      `${appImagePath}\n`,
+      { mode: 0o600 }
+    );
+    if (fsApi.existsSync(versionDir) && !isComplete()) {
+      replacedDir = `${versionDir}.replaced-${process.pid}-${Date.now()}`;
+      fsApi.renameSync(versionDir, replacedDir);
+    }
+    try {
+      fsApi.renameSync(stagingDir, versionDir);
+    } catch (err) {
+      // Another process may have won the same content-addressed install.
+      if (!isComplete()) {
+        if (replacedDir && !fsApi.existsSync(versionDir)) {
+          try { fsApi.renameSync(replacedDir, versionDir); } catch {}
+        }
+        throw err;
+      }
+      fsApi.rmSync(stagingDir, { recursive: true, force: true });
+    }
+    if (replacedDir) fsApi.rmSync(replacedDir, { recursive: true, force: true });
+  } catch (err) {
+    try {
+      fsApi.rmSync(stagingDir, { recursive: true, force: true });
+    } catch {}
+    throw err;
+  }
+  return targetEntry;
 }
 
 function quotePosixEnvValue(value) {
@@ -464,19 +582,52 @@ function registerCodexCommandHooks(options = {}) {
   });
   if (feature.warning) warnings.push(feature.warning);
 
-  const hookScript = asarUnpackedPath(path.resolve(__dirname, scriptName).replace(/\\/g, "/"));
   const settings = readJsonIfPresent(hooksPath, "hooks.json");
   const hostPlatform = options.platform || process.platform;
   const isWindowsHost = hostPlatform === "win32";
+  const processEnv = options.processEnv || process.env;
+  let hookScript = asarUnpackedPath(path.resolve(__dirname, scriptName).replace(/\\/g, "/"));
+  if (hostPlatform === "linux" && processEnv.APPIMAGE) {
+    const extraEntryPaths = scriptName === "codex-hook.js"
+      ? [asarUnpackedPath(path.resolve(__dirname, "auto-start.js").replace(/\\/g, "/"))]
+      : [];
+    hookScript = materializeAppImageHookScript(hookScript, {
+      appImagePath: processEnv.APPIMAGE,
+      homeDir: options.homeDir,
+      materializedRoot: options.materializedRoot,
+      extraEntryPaths,
+    }).replace(/\\/g, "/");
+  }
   const resolved = options.nodeBin !== undefined ? options.nodeBin : resolveNodeBin();
   const nodeBin = resolved
     || (isWindowsHost
       ? extractExistingWindowsNodeBin(settings, marker)
       : extractExistingNodeBin(settings, marker, { nested: true }))
     || "node";
+  const sshSecureRemote = options.remote === true
+    && (options.sshRemote === true || processEnv.CLAWD_SSH_REMOTE === "1");
+  const remoteSecureEnv = options.remote ? {
+    CLAWD_REMOTE: "1",
+    ...(sshSecureRemote ? {
+      CLAWD_SSH_REMOTE: "1",
+      ...(processEnv.CLAWD_REMOTE_IDENTITY_PATH
+        ? { CLAWD_REMOTE_IDENTITY_PATH: processEnv.CLAWD_REMOTE_IDENTITY_PATH }
+        : {}),
+      ...(processEnv.CLAWD_SSH_SECURE_MARKER_PATH
+        ? { CLAWD_SSH_SECURE_MARKER_PATH: processEnv.CLAWD_SSH_SECURE_MARKER_PATH }
+        : {}),
+      ...(processEnv.CLAWD_HOST_PREFIX_PATH
+        ? { CLAWD_HOST_PREFIX_PATH: processEnv.CLAWD_HOST_PREFIX_PATH }
+        : {}),
+      ...(processEnv.CLAWD_REMOTE_LAST_LOG_PATH
+        ? { CLAWD_REMOTE_LAST_LOG_PATH: processEnv.CLAWD_REMOTE_LAST_LOG_PATH }
+        : {}),
+      ...(processEnv.CODEX_HOME ? { CODEX_HOME: processEnv.CODEX_HOME } : {}),
+    } : {}),
+  } : {};
   const commandEnv = {
     ...(options.env || {}),
-    ...(options.remote ? { CLAWD_REMOTE: "1" } : {}),
+    ...remoteSecureEnv,
   };
   // On a Windows host, a WSL session may consume this hooks.json through a
   // shared CODEX_HOME (#544). Codex resolves `commandWindows` on Windows and
@@ -634,21 +785,35 @@ function unregisterCodexCommandHooks(options = {}) {
 }
 
 module.exports = {
-  DEFAULT_PARENT_DIR,
-  DEFAULT_CONFIG_PATH,
-  DEFAULT_FEATURES_CONFIG,
   CODEX_HOOK_EVENTS,
+  CODEX_WSL_INTEROP_ARG,
   CODEX_HOOKS_FEATURE_KEY,
   LEGACY_CODEX_HOOKS_FEATURE_KEY,
   buildCodexHookCommand,
   buildCodexHookPosixInteropCommand,
+  collectRelativeHookClosure,
   ensureCodexHooksFeature,
   extractExistingWindowsNodeBin,
   findCodexCommandHook,
   parseTomlTableHeader,
+  materializeAppImageHookScript,
   registerCodexCommandHooks,
   timeoutForCodexEvent,
   unregisterCodexCommandHooks,
   windowsPathToWslPath,
   withCommandEnv,
+  resolveCodexHome,
 };
+
+Object.defineProperty(module.exports, "DEFAULT_PARENT_DIR", {
+  enumerable: true,
+  get() { return resolveCodexHome(); },
+});
+Object.defineProperty(module.exports, "DEFAULT_CONFIG_PATH", {
+  enumerable: true,
+  get() { return path.join(resolveCodexHome(), "hooks.json"); },
+});
+Object.defineProperty(module.exports, "DEFAULT_FEATURES_CONFIG", {
+  enumerable: true,
+  get() { return path.join(resolveCodexHome(), "config.toml"); },
+});

@@ -11,6 +11,7 @@ themeLoader.init(path.join(__dirname, "..", "src"));
 const _defaultTheme = themeLoader.loadTheme("clawd");
 const _calicoTheme = themeLoader.loadTheme("calico");
 const { createTranslator } = require("../src/i18n");
+const { makeSessionKey } = require("../src/session-key");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -76,8 +77,11 @@ function update(api, o = {}) {
       cwd: o.cwd || "/tmp",
       editor: o.editor || null,
       pidChain: o.pidChain || null,
+      orcaPaneKey: o.orcaPaneKey ?? null,
       agentPid: o.agentPid ?? null,
       agentId: o.agentId || "claude-code",
+      profileId: o.profileId,
+      rawSessionId: o.rawSessionId,
       host: o.host || null,
       headless: o.headless || false,
       displayHint: o.displayHint,
@@ -98,9 +102,96 @@ function update(api, o = {}) {
       backgroundTasksCount: o.backgroundTasksCount ?? 0,
       sessionCronsCount: o.sessionCronsCount ?? 0,
       stopHookActive: o.stopHookActive ?? false,
+      transientPermissionEvent: o.transientPermissionEvent === true,
+      sessionAutomationIdentity: o.sessionAutomationIdentity ?? null,
+      subagentId: o.subagentId ?? null,
+      subagentType: o.subagentType ?? null,
     },
   );
 }
+
+describe("remote profile session namespace", () => {
+  let api;
+
+  afterEach(() => { if (api) api.cleanup(); });
+
+  it("keeps identical raw ids independent through update, permission, stale cleanup, ack, and end", () => {
+    api = require("../src/state")(makeCtx());
+    const rawSessionId = "same-raw-session";
+    const aId = makeSessionKey({ profileId: "profile-a", rawSessionId });
+    const bId = makeSessionKey({ profileId: "profile-b", rawSessionId });
+
+    update(api, {
+      id: aId,
+      state: "working",
+      event: "PreToolUse",
+      profileId: "profile-a",
+      rawSessionId,
+      host: "shared-host",
+      agentId: "codex",
+    });
+    update(api, {
+      id: bId,
+      state: "thinking",
+      event: "UserPromptSubmit",
+      profileId: "profile-b",
+      rawSessionId,
+      host: "shared-host",
+      agentId: "codex",
+    });
+    assert.strictEqual(api.sessions.size, 2);
+    assert.strictEqual(api.sessions.get(aId).profileId, "profile-a");
+    assert.strictEqual(api.sessions.get(bId).profileId, "profile-b");
+
+    update(api, {
+      id: aId,
+      state: "notification",
+      event: "PermissionRequest",
+      transientPermissionEvent: true,
+      profileId: "profile-a",
+      rawSessionId,
+      host: "shared-host",
+      agentId: "codex",
+    });
+    assert.strictEqual(api.sessions.get(aId).state, "working");
+    assert.strictEqual(api.sessions.get(bId).state, "thinking");
+
+    update(api, {
+      id: aId,
+      state: "sleeping",
+      event: "stale-cleanup",
+      profileId: "profile-a",
+      rawSessionId,
+      host: "shared-host",
+      agentId: "codex",
+    });
+    assert.ok(api.sessions.has(bId), "A stale cleanup cannot remove B");
+
+    update(api, {
+      id: bId,
+      state: "idle",
+      event: "Stop",
+      profileId: "profile-b",
+      rawSessionId,
+      host: "shared-host",
+      agentId: "codex",
+    });
+    assert.strictEqual(api.ackSessionCompletion(bId), true);
+    assert.notStrictEqual(api.sessions.get(aId).completionAcknowledged, true);
+
+    update(api, {
+      id: aId,
+      state: "idle",
+      event: "SessionEnd",
+      profileId: "profile-a",
+      rawSessionId,
+      host: "shared-host",
+      agentId: "codex",
+    });
+    assert.strictEqual(api.sessions.has(aId), false);
+    assert.strictEqual(api.sessions.has(bId), true);
+  });
+});
 
 /** Create a raw session object for direct Map insertion */
 function rawSession(state, opts = {}) {
@@ -133,6 +224,78 @@ function rawSession(state, opts = {}) {
 // ═════════════════════════════════════════════════════════════════════════════
 // Group 1: resolveDisplayState() priority
 // ═════════════════════════════════════════════════════════════════════════════
+
+describe("restoreSessionFromLease()", () => {
+  let api;
+
+  afterEach(() => { if (api) api.cleanup(); });
+
+  function lease(overrides = {}) {
+    return {
+      version: 1,
+      agentId: "claude-code",
+      sessionId: "claude-real-session",
+      active: true,
+      state: "working",
+      eventAt: Date.now() - 1000,
+      validUntil: null,
+      pid: process.pid,
+      sourcePid: process.pid,
+      processStartIdentity: null,
+      sourceProcessStartIdentity: null,
+      cwd: "C:/work/project",
+      title: "Recovered task",
+      ...overrides,
+    };
+  }
+
+  it("restores the real session without replaying sounds, events, or broadcasts", () => {
+    const sounds = [];
+    const broadcasts = [];
+    api = require("../src/state")(makeCtx({
+      processKill: () => true,
+      playSound: (name) => sounds.push(name),
+      broadcastSessionSnapshot: (snapshot) => broadcasts.push(snapshot),
+    }));
+    assert.strictEqual(api.restoreSessionFromLease(lease()), true);
+    assert.deepStrictEqual(sounds, []);
+    assert.deepStrictEqual(broadcasts, []);
+    assert.strictEqual(api.sessions.size, 1);
+    const session = api.sessions.get("claude-real-session");
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.startupRecovered, true);
+    assert.deepStrictEqual(session.recentEvents, []);
+    assert.strictEqual(session.requiresCompletionAck, undefined);
+    const entry = api.buildSessionSnapshot().sessions[0];
+    assert.strictEqual(entry.id, "claude-real-session");
+    assert.strictEqual(entry.startupRecovered, true);
+    assert.strictEqual(entry.canFocus, false);
+  });
+
+  it("lets the next real hook update the same id and clear only its marker", () => {
+    api = require("../src/state")(makeCtx({ processKill: () => true }));
+    assert.strictEqual(api.restoreSessionFromLease(lease()), true);
+    assert.strictEqual(api.restoreSessionFromLease(lease({ sessionId: "other-session", state: "thinking" })), true);
+    update(api, {
+      id: "claude-real-session",
+      state: "working",
+      event: "PostToolUse",
+      sourcePid: process.pid,
+      agentPid: process.pid,
+    });
+    assert.strictEqual(api.sessions.size, 2);
+    assert.strictEqual(api.sessions.get("claude-real-session").startupRecovered, undefined);
+    assert.strictEqual(api.sessions.get("other-session").startupRecovered, true);
+  });
+
+  it("never overwrites a session that arrived from a real hook first", () => {
+    api = require("../src/state")(makeCtx({ processKill: () => true }));
+    update(api, { id: "claude-real-session", state: "thinking", event: "UserPromptSubmit" });
+    assert.strictEqual(api.restoreSessionFromLease(lease()), false);
+    assert.strictEqual(api.sessions.get("claude-real-session").state, "thinking");
+    assert.strictEqual(api.sessions.get("claude-real-session").startupRecovered, undefined);
+  });
+});
 
 describe("resolveDisplayState()", () => {
   let api;
@@ -321,6 +484,36 @@ describe("setState() debounce", () => {
     assert.strictEqual(api.getCurrentState(), "idle");
   });
 
+  it("bypassMinDisplay immediately exits an interruptible roam hold and clears its pending idle", () => {
+    api.cleanup();
+    const theme = cloneTheme(_defaultTheme);
+    theme.timings.minDisplay.roam = 60000;
+    const stateChanges = [];
+    ctx = makeCtx({
+      theme,
+      sendToRenderer: (channel, state) => {
+        if (channel === "state-change") stateChanges.push(state);
+      },
+    });
+    api = require("../src/state")(ctx);
+
+    api.applyState("roam");
+    stateChanges.length = 0;
+
+    api.setState("idle");
+    assert.strictEqual(api.getCurrentState(), "roam",
+      "a normal transition should still respect the theme's roam min-display");
+
+    api.setState("idle", undefined, { bypassMinDisplay: true });
+    assert.strictEqual(api.getCurrentState(), "idle",
+      "an explicit interruption must restore idle immediately");
+    assert.deepStrictEqual(stateChanges, ["idle"]);
+
+    mock.timers.tick(60000);
+    assert.deepStrictEqual(stateChanges, ["idle"],
+      "the superseded delayed idle must not fire later");
+  });
+
   it("higher priority overrides pending", () => {
     api.setState("working");
     api.setState("idle"); // pending
@@ -335,13 +528,14 @@ describe("setState() debounce", () => {
     // error MIN_DISPLAY_MS = 5000
     api.setState("notification"); // pending, prio 7 (ONESHOT — applies directly)
     api.setState("attention");    // prio 5 < notification 7, rejected
+    api.setState("idle", undefined, { bypassMinDisplay: true }); // bypass must not bypass priority
     mock.timers.tick(5000);
     assert.strictEqual(api.getCurrentState(), "notification");
   });
 
   it("DND → setState is no-op", () => {
     ctx.doNotDisturb = true;
-    api.setState("working");
+    api.setState("working", undefined, { bypassMinDisplay: true });
     assert.strictEqual(api.getCurrentState(), "idle");
   });
 
@@ -570,6 +764,25 @@ describe("wake poll behavior", () => {
     assert.strictEqual(api.getCurrentState(), "idle");
   });
 
+  it("wake-from-doze returns to the user-selected idle visual", () => {
+    api.cleanup();
+    ctx = makeCtx({
+      getCursorScreenPoint: () => ({ ...fakeCursor }),
+      getIdleVisualChoice: () => "clawd-idle-reading.svg",
+    });
+    const changes = [];
+    ctx.sendToRenderer = (ev, ...args) => { if (ev === "state-change") changes.push(args); };
+    api = require("../src/state")(ctx);
+
+    api.applyState("dozing");
+    mock.timers.tick(500);
+    fakeCursor.x = 200;
+    mock.timers.tick(200);
+    mock.timers.tick(350);
+    assert.strictEqual(api.getCurrentState(), "idle");
+    assert.deepStrictEqual(changes[changes.length - 1], ["idle", "clawd-idle-reading.svg"]);
+  });
+
   it("collapsing + mouse move → waking", () => {
     api.applyState("collapsing");
     mock.timers.tick(500); // wake poll delay
@@ -668,6 +881,39 @@ describe("cleanStaleSessions()", () => {
     api.sessions.set("s1", rawSession("working", { agentPid: 9999, pidReachable: true }));
     api.cleanStaleSessions();
     assert.strictEqual(api.sessions.size, 0);
+  });
+
+  it("clears the exact session automation identity before stale deletion", () => {
+    const lifecycle = [];
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      onSessionAutomationLifecycleEnd: (payload) => lifecycle.push(payload),
+    }));
+    api.sessions.set("s1", rawSession("working", {
+      agentId: "claude-code",
+      agentPid: 9999,
+      pidReachable: true,
+    }));
+    api.cleanStaleSessions();
+    assert.deepStrictEqual(lifecycle, [{
+      agentId: "claude-code",
+      sessionId: "s1",
+      reason: "stale-delete-agent-exit",
+    }]);
+    assert.strictEqual(api.sessions.size, 0);
+  });
+
+  it("empty-session return rests on the user-selected idle visual", () => {
+    const changes = [];
+    api = require("../src/state")(makeCtx({
+      processKill: makePidKill(new Set()),
+      getIdleVisualChoice: () => "clawd-idle-reading.svg",
+      sendToRenderer: (ev, ...args) => { if (ev === "state-change") changes.push(args); },
+    }));
+    api.sessions.set("s1", rawSession("working", { agentPid: 9999, pidReachable: true }));
+    api.cleanStaleSessions();
+    assert.strictEqual(api.sessions.size, 0);
+    assert.deepStrictEqual(changes[changes.length - 1], ["idle", "clawd-idle-reading.svg"]);
   });
 
   it("agentPid alive + sourcePid dead + stale → delete", () => {
@@ -857,6 +1103,35 @@ describe("updateSession()", () => {
     assert.strictEqual(api.sessions.get("new1").state, "working");
   });
 
+  it("stores only a normalized route-owned session automation assessment", () => {
+    update(api, {
+      id: "automation-identity",
+      sessionAutomationIdentity: {
+        eligible: false,
+        reason: "  placeholder-session-id  ",
+        senderControlledExtra: true,
+      },
+    });
+
+    const stored = api.sessions.get("automation-identity").sessionAutomationIdentity;
+    assert.deepStrictEqual(stored, {
+      eligible: false,
+      reason: "placeholder-session-id",
+    });
+    assert.strictEqual(Object.isFrozen(stored), true);
+
+    update(api, {
+      id: "automation-identity",
+      event: "PostToolUse",
+      sessionAutomationIdentity: { eligible: "yes", reason: "malformed" },
+    });
+    assert.deepStrictEqual(
+      api.sessions.get("automation-identity").sessionAutomationIdentity,
+      { eligible: false, reason: "invalid-route-assessment" },
+      "malformed internal input must fail closed instead of preserving eligibility"
+    );
+  });
+
   // #627 safety net: the pid-snapshot cache omits pid_chain on cache-hit events,
   // relying on updateSession MERGING (keeping the last pidChain) rather than
   // OVERWRITING it to null. If a future refactor flips this to overwrite, the
@@ -985,6 +1260,34 @@ describe("updateSession()", () => {
     assert.ok(!api.sessions.has("s1"));
   });
 
+  it("clears session automation before a main SessionEnd but not a subagent lifecycle event", () => {
+    api.cleanup();
+    const lifecycle = [];
+    api = require("../src/state")(makeCtx({
+      onSessionAutomationLifecycleEnd: (payload) => lifecycle.push(payload),
+    }));
+    update(api, { id: "main", agentId: "claude-code", state: "working" });
+    update(api, {
+      id: "main",
+      agentId: "claude-code",
+      state: "sleeping",
+      event: "SessionEnd",
+    });
+    update(api, { id: "sub", agentId: "claude-code", state: "working" });
+    update(api, {
+      id: "sub",
+      agentId: "claude-code",
+      state: "sleeping",
+      event: "SessionEnd",
+      subagentId: "child-1",
+    });
+    assert.deepStrictEqual(lifecycle, [{
+      agentId: "claude-code",
+      sessionId: "main",
+      reason: "session-end",
+    }]);
+  });
+
   it("dismissSession removes only Clawd bookkeeping for that session", () => {
     update(api, { id: "s1", state: "working" });
     update(api, { id: "s2", state: "thinking" });
@@ -997,9 +1300,104 @@ describe("updateSession()", () => {
   });
 
   it("PermissionRequest → notification state, no session creation", () => {
-    update(api, { id: "perm1", state: "notification", event: "PermissionRequest" });
+    update(api, {
+      id: "perm1",
+      state: "notification",
+      event: "PermissionRequest",
+      sessionAutomationIdentity: { eligible: true, reason: "eligible" },
+    });
     assert.ok(!api.sessions.has("perm1"));
     assert.strictEqual(api.getCurrentState(), "notification");
+  });
+
+  it("PermissionRequest refreshes identity only on an existing same-agent session", () => {
+    update(api, {
+      id: "perm-existing",
+      state: "working",
+      event: "PreToolUse",
+      agentId: "claude-code",
+    });
+    const existing = api.sessions.get("perm-existing");
+    existing.startupRecovered = true;
+    assert.strictEqual(existing.sessionAutomationIdentity, null);
+
+    update(api, {
+      id: "perm-existing",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "claude-code",
+      sessionAutomationIdentity: { eligible: true, reason: "eligible" },
+    });
+
+    assert.strictEqual(api.sessions.get("perm-existing").state, "working");
+    assert.strictEqual(api.sessions.get("perm-existing").startupRecovered, true);
+    assert.deepStrictEqual(
+      api.sessions.get("perm-existing").sessionAutomationIdentity,
+      { eligible: true, reason: "eligible" }
+    );
+
+    update(api, {
+      id: "perm-existing",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "claude-code",
+      sessionAutomationIdentity: { eligible: false, reason: "placeholder-session-id" },
+    });
+    assert.deepStrictEqual(
+      api.sessions.get("perm-existing").sessionAutomationIdentity,
+      { eligible: false, reason: "placeholder-session-id" },
+      "a later fail-closed route assessment must replace stale eligibility"
+    );
+  });
+
+  it("PermissionRequest never writes an identity across an agent collision", () => {
+    update(api, {
+      id: "shared-session-id",
+      state: "working",
+      event: "PreToolUse",
+      agentId: "codex",
+      sessionAutomationIdentity: { eligible: false, reason: "codex-unverified" },
+    });
+
+    update(api, {
+      id: "shared-session-id",
+      state: "notification",
+      event: "PermissionRequest",
+      agentId: "claude-code",
+      sessionAutomationIdentity: { eligible: true, reason: "eligible" },
+    });
+
+    const session = api.sessions.get("shared-session-id");
+    assert.strictEqual(session.agentId, "codex");
+    assert.deepStrictEqual(
+      session.sessionAutomationIdentity,
+      { eligible: false, reason: "codex-unverified" }
+    );
+  });
+
+  it("Codex user-input request flashes notification while preserving session state", () => {
+    update(api, {
+      id: "codex:question",
+      state: "working",
+      event: "PreToolUse",
+      agentId: "codex",
+      sourcePid: 456,
+      cwd: "/repo",
+    });
+    update(api, {
+      id: "codex:question",
+      state: "notification",
+      event: "CodexUserInputRequest",
+      agentId: "codex",
+      sourcePid: 456,
+      cwd: "/repo",
+      transientPermissionEvent: true,
+    });
+
+    assert.strictEqual(api.sessions.get("codex:question").state, "working");
+    mock.timers.tick(1000);
+    assert.strictEqual(api.getCurrentState(), "notification");
+    assert.strictEqual(api.sessions.get("codex:question").recentEvents.at(-1).event, "PreToolUse");
   });
 
   it("Codex PermissionRequest persists focus metadata for snapshots", () => {
@@ -1084,6 +1482,137 @@ describe("updateSession()", () => {
     assert.strictEqual(session.wtHwnd, "123456");
     const entry = api.getLastSessionSnapshot().sessions.find((item) => item.id === "s1");
     assert.strictEqual(entry.wtHwnd, "123456");
+  });
+
+  it("keeps the Orca pane key sticky across later events that omit it", () => {
+    // Remote bodies never carry the pane key and some agents post state without
+    // the process-metadata block at all, so a later event without it must not
+    // blank the key or focus loses the pane.
+    update(api, {
+      id: "s1",
+      state: "thinking",
+      event: "UserPromptSubmit",
+      sourcePid: 100,
+      orcaPaneKey: "tab-1:leaf-1",
+    });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
+
+    update(api, { id: "s1", state: "working", event: "PreToolUse", sourcePid: 100 });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
+
+    update(api, {
+      id: "s1",
+      state: "working",
+      event: "PreToolUse",
+      sourcePid: 100,
+      orcaPaneKey: "tab-2:leaf-2",
+    });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-2:leaf-2");
+  });
+
+  it("drops a stale Orca pane key when the session restarts in another terminal", () => {
+    update(api, {
+      id: "s1",
+      state: "thinking",
+      event: "UserPromptSubmit",
+      sourcePid: 100,
+      orcaPaneKey: "tab-1:leaf-1",
+    });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
+
+    // Resuming the same session id from a different terminal posts a SessionStart
+    // whose env has no pane key. Keeping the old one would raise Orca instead of
+    // the terminal the agent actually moved to, and the pane key outranks the
+    // wt_hwnd that would have been correct.
+    update(api, { id: "s1", state: "idle", event: "SessionStart", sourcePid: 200, wtHwnd: "4660" });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, null);
+    assert.strictEqual(api.sessions.get("s1").wtHwnd, "4660");
+
+    // A SessionStart that does carry one still wins.
+    update(api, {
+      id: "s1",
+      state: "idle",
+      event: "SessionStart",
+      sourcePid: 300,
+      orcaPaneKey: "tab-9:leaf-9",
+    });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-9:leaf-9");
+  });
+
+  it("drops a stale Orca pane key on every spelling of a session start", () => {
+    // Producers do not agree on the name: copilot-hook.js posts its raw argv name
+    // "sessionStart" and kiro-hook.js posts "agentSpawn". Matching only
+    // "SessionStart" left both able to keep a stale key indefinitely, and Kiro is
+    // the worst case — its stdin carries no session id, so every session merges
+    // into "default" and the key would never be cleared at all.
+    for (const event of ["SessionStart", "sessionStart", "agentSpawn"]) {
+      update(api, {
+        id: "s1",
+        state: "thinking",
+        event: "UserPromptSubmit",
+        sourcePid: 100,
+        orcaPaneKey: "tab-1:leaf-1",
+      });
+      assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
+
+      update(api, { id: "s1", state: "idle", event, sourcePid: 200, wtHwnd: "4660" });
+      assert.strictEqual(api.sessions.get("s1").orcaPaneKey, null, `${event} must clear the pane key`);
+    }
+  });
+
+  it("drops a stale Orca pane key when a producer with no session-start event moves terminal", () => {
+    // antigravity-hook.js posts none of the three session-start spellings, so the
+    // event-name rule never fires for it and a pane key outlived its pane forever.
+    // Its id normalizes payload.conversationId, so resuming the same conversation
+    // from another terminal lands back on this same entry.
+    update(api, {
+      id: "s1",
+      state: "thinking",
+      event: "agentMessage",
+      sourcePid: 100,
+      orcaPaneKey: "tab-1:leaf-1",
+    });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
+
+    update(api, { id: "s1", state: "working", event: "agentMessage", sourcePid: 200, wtHwnd: "4660" });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, null);
+    assert.strictEqual(api.sessions.get("s1").sourcePid, 200);
+    assert.strictEqual(api.sessions.get("s1").wtHwnd, "4660");
+  });
+
+  it("drops a stale Orca pane key when only the terminal window handle changes", () => {
+    update(api, {
+      id: "s1",
+      state: "thinking",
+      event: "agentMessage",
+      sourcePid: 100,
+      wtHwnd: "1111",
+      orcaPaneKey: "tab-1:leaf-1",
+    });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
+
+    update(api, { id: "s1", state: "working", event: "agentMessage", sourcePid: 100, wtHwnd: "2222" });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, null);
+  });
+
+  it("keeps the Orca pane key when a later event carries no new terminal identity", () => {
+    update(api, {
+      id: "s1",
+      state: "thinking",
+      event: "agentMessage",
+      sourcePid: 100,
+      orcaPaneKey: "tab-1:leaf-1",
+    });
+
+    // Most events omit the process-metadata block entirely; treating "absent" as
+    // "changed" would blank the key on the very next event and undo the feature.
+    update(api, { id: "s1", state: "working", event: "agentMessage" });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
+
+    // Producers are not consistent about the wire type of the pid, and a bare
+    // !== would read 100 and "100" as two different terminals.
+    update(api, { id: "s1", state: "working", event: "agentMessage", sourcePid: "100" });
+    assert.strictEqual(api.sessions.get("s1").orcaPaneKey, "tab-1:leaf-1");
   });
 
   it("keeps Ghostty terminal id sticky and allows focus-only metadata updates", () => {
@@ -1736,6 +2265,48 @@ describe("updateSession()", () => {
     });
   });
 
+  it("preserveState does not stop a one-shot visual from playing (cross-file contract)", () => {
+    // Characterization, not endorsement. preserveState pins the STORED state;
+    // the one-shot branch plays whatever `state` it is handed and bypasses
+    // resolveDisplayState() entirely. So a metadata-only update that carries a
+    // one-shot still animates the pet, even though the session stays idle.
+    //
+    // agents/codex-log-monitor.js depends on this: it filters `token_count`'s
+    // carried state down to sustained ones precisely because preserveState
+    // would not save it. If this test ever fails because preserveState grew to
+    // cover one-shots, that filter becomes redundant (harmless) — update it
+    // there rather than deleting it blind.
+    const stateChanges = [];
+    api.cleanup();
+    ctx = makeCtx({
+      processKill: () => true,
+      sendToRenderer: (channel, state) => {
+        if (channel === "state-change") stateChanges.push(state);
+      },
+    });
+    api = require("../src/state")(ctx);
+
+    // Turn is long over; pet is back to idle. This is what Codex Desktop's
+    // focus-triggered token_count refresh actually lands on.
+    api.updateSession("codex:s1", "idle", "event_msg:task_complete", {
+      agentId: "codex",
+      cwd: "/tmp",
+    });
+    stateChanges.length = 0;
+
+    api.updateSession("codex:s1", "attention", "event_msg:token_count", {
+      agentId: "codex",
+      cwd: "/tmp",
+      preserveState: true,
+      contextUsage: { used: 2000, limit: 200000, percent: 1, source: "codex" },
+    });
+
+    assert.strictEqual(api.sessions.get("codex:s1").state, "idle",
+      "preserveState must pin the stored state");
+    assert.deepStrictEqual(stateChanges, ["attention"],
+      "and yet the one-shot visual still plays — this is why the monitor filters the carry");
+  });
+
   it("updates contextUsage without changing state when preserveState is true", () => {
     update(api, {
       id: "codex:abc",
@@ -1764,123 +2335,163 @@ describe("updateSession()", () => {
     });
   });
 
-  it("stores antigravityQuota from updateSession opts", () => {
-    update(api, {
-      id: "s1",
-      state: "working",
-      antigravityQuota: {
-        geminiFiveHour: { usedPercent: 100 },
-        geminiWeekly: { usedPercent: 98, resetAt: 1738831180000 },
-      },
-    });
-
-    assert.deepStrictEqual(api.sessions.get("s1").antigravityQuota, {
-      geminiFiveHour: { usedPercent: 100 },
-      geminiWeekly: { usedPercent: 98, resetAt: 1738831180000 },
-    });
-  });
-
-  it("keeps antigravityQuota sticky when later events omit it", () => {
-    update(api, {
-      id: "s1",
-      state: "thinking",
-      antigravityQuota: { thirdPartyWeekly: { usedPercent: 69 } },
-    });
-    update(api, { id: "s1", state: "working" });
-
-    assert.deepStrictEqual(api.sessions.get("s1").antigravityQuota, {
-      thirdPartyWeekly: { usedPercent: 69 },
-    });
-  });
-
-  it("updates antigravityQuota without changing state when preserveState is true", () => {
-    update(api, {
-      id: "antigravity:abc",
-      state: "working",
-      agentId: "antigravity-cli",
-    });
-    api.updateSession("antigravity:abc", "idle", undefined, {
-      agentId: "antigravity-cli",
-      cwd: "/tmp",
-      preserveState: true,
-      antigravityQuota: { geminiWeekly: { usedPercent: 98, resetAt: 1738831180000 } },
-    });
-
-    const session = api.sessions.get("antigravity:abc");
-    assert.strictEqual(session.state, "working");
-    assert.deepStrictEqual(session.antigravityQuota, {
-      geminiWeekly: { usedPercent: 98, resetAt: 1738831180000 },
-    });
-  });
-
-  it("stores claudeQuota from updateSession opts", () => {
-    update(api, {
-      id: "s1",
-      state: "working",
+  // Account quota is not session state: it lives in the session-independent
+  // per-source store (src/state-account-quota.js), fed via updateAccountQuota
+  // and exported as snapshot.accountQuota — the headline case is "check a
+  // remote's quota before starting work" when no session exists at all.
+  it("updateAccountQuota stores per-source quota with no session required", () => {
+    const resetAt = Date.now() + 3600000;
+    const applied = api.updateAccountQuota("pi", {
       claudeQuota: {
-        claudeFiveHour: { usedPercent: 24, resetAt: 1738425600000 },
+        claudeFiveHour: { usedPercent: 24, resetAt },
         claudeWeekly: { usedPercent: 41 },
       },
     });
 
-    assert.deepStrictEqual(api.sessions.get("s1").claudeQuota, {
-      claudeFiveHour: { usedPercent: 24, resetAt: 1738425600000 },
-      claudeWeekly: { usedPercent: 41 },
+    assert.strictEqual(applied, true);
+    assert.strictEqual(api.sessions.size, 0, "quota must never create sessions");
+    const { snapshot } = api.emitSessionSnapshot({ force: true });
+    assert.strictEqual(snapshot.accountQuota.length, 1);
+    const entry = snapshot.accountQuota[0];
+    assert.strictEqual(entry.host, "pi");
+    assert.deepStrictEqual(entry.claudeQuota.group, {
+      claudeFiveHour: { usedPercent: 24, resetAt, lastSeenAt: 0 },
+      claudeWeekly: { usedPercent: 41, lastSeenAt: 0 },
     });
+    assert.ok(Number.isFinite(entry.claudeQuota.updatedAt));
   });
 
-  it("keeps claudeQuota sticky when later events omit it", () => {
-    update(api, {
-      id: "s1",
-      state: "thinking",
-      claudeQuota: { claudeWeekly: { usedPercent: 41 } },
-    });
-    update(api, { id: "s1", state: "working" });
+  it("updateAccountQuota keeps sources independent and sorts local first", () => {
+    const resetAt = Date.now() + 3600000;
+    api.updateAccountQuota("pi", { codexQuota: { codexWeekly: { usedPercent: 43, resetAt } } });
+    api.updateAccountQuota(null, { codexQuota: { codexWeekly: { usedPercent: 7, resetAt } } });
 
-    assert.deepStrictEqual(api.sessions.get("s1").claudeQuota, {
-      claudeWeekly: { usedPercent: 41 },
-    });
+    const { snapshot } = api.emitSessionSnapshot({ force: true });
+    assert.deepStrictEqual(snapshot.accountQuota.map((e) => e.host), [null, "pi"]);
+    assert.strictEqual(snapshot.accountQuota[0].codexQuota.group.codexWeekly.usedPercent, 7);
+    assert.strictEqual(snapshot.accountQuota[1].codexQuota.group.codexWeekly.usedPercent, 43);
   });
 
-  it("updates claudeQuota without changing state when preserveState is true", () => {
-    update(api, { id: "s1", state: "working" });
-    api.updateSession("s1", "idle", undefined, {
-      preserveState: true,
-      claudeQuota: { claudeFiveHour: { usedPercent: 24, resetAt: 1738425600000 } },
+  it("updateAccountQuota change-detects identical refreshes (no re-broadcast, no re-stamp)", () => {
+    const broadcasts = [];
+    const localApi = require("../src/state")(makeCtx({
+      broadcastSessionSnapshot: (snapshot) => broadcasts.push(snapshot),
+    }));
+    const resetAt = Date.now() + 3600000;
+    localApi.updateAccountQuota(null, { claudeQuota: { claudeWeekly: { usedPercent: 41, resetAt } } });
+    const before = broadcasts.length;
+    assert.ok(before > 0, "first quota report must broadcast");
+    const stampBefore = localApi.getLastSessionSnapshot().accountQuota[0].claudeQuota.updatedAt;
+
+    const applied = localApi.updateAccountQuota(null, {
+      claudeQuota: { claudeWeekly: { usedPercent: 41, resetAt } },
     });
 
-    const session = api.sessions.get("s1");
-    assert.strictEqual(session.state, "working");
-    assert.deepStrictEqual(session.claudeQuota, {
-      claudeFiveHour: { usedPercent: 24, resetAt: 1738425600000 },
+    assert.strictEqual(applied, false);
+    assert.strictEqual(broadcasts.length, before, "identical refresh must not re-broadcast");
+    assert.strictEqual(
+      localApi.getLastSessionSnapshot().accountQuota[0].claudeQuota.updatedAt,
+      stampBefore,
+      "identical refresh must not look fresher"
+    );
+  });
+
+  it("broadcasts consecutive Spark-only quota changes for the same source", () => {
+    const broadcasts = [];
+    const localApi = require("../src/state")(makeCtx({
+      broadcastSessionSnapshot: (snapshot) => broadcasts.push(snapshot),
+    }));
+    const resetAt = Date.now() + 3600000;
+    localApi.updateAccountQuota(null, {
+      codexSparkQuota: {
+        codexWeekly: { usedPercent: 7, windowMinutes: 10080, resetAt },
+      },
     });
+    const afterFirst = broadcasts.length;
+    assert.ok(afterFirst > 0, "first Spark report must broadcast");
+
+    localApi.updateAccountQuota(null, {
+      codexSparkQuota: {
+        codexWeekly: { usedPercent: 9, windowMinutes: 10080, resetAt },
+      },
+    });
+    assert.strictEqual(broadcasts.length, afterFirst + 1);
+    assert.strictEqual(
+      broadcasts.at(-1).accountQuota[0].codexSparkQuota.group.codexWeekly.usedPercent,
+      9
+    );
+    localApi.cleanup();
+  });
+
+  it("updateAccountQuota drops invalid groups", () => {
+    const applied = api.updateAccountQuota("pi", {
+      claudeQuota: { claudeFiveHour: { usedPercent: "not-a-number" } },
+    });
+
+    assert.strictEqual(applied, false);
+    const { snapshot } = api.emitSessionSnapshot({ force: true });
+    assert.deepStrictEqual(snapshot.accountQuota, []);
+  });
+
+  it("cleanup flushes pending account-quota writes to disk (before-quit path)", () => {
+    const persistPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "clawd-aq-")), "account-quota.json");
+    const localApi = require("../src/state")(makeCtx({ accountQuotaPersistPath: persistPath }));
+    localApi.updateAccountQuota("pi", {
+      claudeQuota: { claudeWeekly: { usedPercent: 41, resetAt: Date.now() + 3600000 } },
+    });
+    // The persist debounce has not fired yet — before-quit cleanup must not
+    // lose the final window of updates.
+    localApi.cleanup();
+
+    const persisted = JSON.parse(fs.readFileSync(persistPath, "utf8"));
+    assert.strictEqual(persisted.sources.length, 1);
+    assert.strictEqual(persisted.sources[0].host, "pi");
+  });
+
+  it("rejects incoming buckets whose resetAt already passed, keeps live siblings", () => {
+    api.updateAccountQuota(null, {
+      claudeQuota: {
+        // Already expired at write time: the number is wrong, not stale —
+        // the store refuses it outright. (Buckets that expire AFTER being
+        // stored are flagged instead; covered with a mocked clock in
+        // test/state-account-quota.test.js.)
+        claudeFiveHour: { usedPercent: 80, resetAt: Date.now() - 60000 },
+        claudeWeekly: { usedPercent: 41, resetAt: Date.now() + 3600000 },
+      },
+    });
+
+    const { snapshot } = api.emitSessionSnapshot({ force: true });
+    const group = snapshot.accountQuota[0].claudeQuota.group;
+    assert.strictEqual(group.claudeFiveHour, undefined);
+    assert.strictEqual(group.claudeWeekly.expired, undefined);
+    assert.strictEqual(group.claudeWeekly.usedPercent, 41);
   });
 
   // #590 B2 — statusline refresh POSTs go through updateSessionMetadata,
-  // which annotates quota/context onto an existing session and does nothing
+  // which annotates context usage onto an existing session and does nothing
   // else: no session creation, no recentEvents append, no updatedAt bump.
-  it("updateSessionMetadata annotates quota without touching lifecycle fields", () => {
+  // (Account quota deliberately does NOT flow through here — see the
+  // updateAccountQuota tests above.)
+  it("updateSessionMetadata annotates contextUsage without touching lifecycle fields", () => {
     update(api, { id: "s1", state: "working" });
     const session = api.sessions.get("s1");
     session.updatedAt = 12345; // pin so a bump is detectable
     const recentEventsBefore = JSON.stringify(session.recentEvents);
 
     const applied = api.updateSessionMetadata("s1", {
-      claudeQuota: { claudeFiveHour: { usedPercent: 24, resetAt: 1738425600000 } },
+      contextUsage: { used: 50000, limit: 200000, percent: 25, source: "claude" },
     });
 
     assert.strictEqual(applied, true);
     assert.strictEqual(session.state, "working");
     assert.strictEqual(session.updatedAt, 12345);
     assert.strictEqual(JSON.stringify(session.recentEvents), recentEventsBefore);
-    assert.deepStrictEqual(session.claudeQuota, {
-      claudeFiveHour: { usedPercent: 24, resetAt: 1738425600000 },
-    });
+    assert.deepStrictEqual(session.contextUsage, { used: 50000, limit: 200000, percent: 25, source: "claude" });
+    assert.ok(Number.isFinite(session.metadataUpdatedAt), "telemetry change must stamp metadataUpdatedAt");
   });
 
   it("updateSessionMetadata never creates a session for an unknown id", () => {
     const applied = api.updateSessionMetadata("ghost", {
-      claudeQuota: { claudeWeekly: { usedPercent: 55 } },
       contextUsage: { used: 1000, limit: 200000, percent: 1, source: "claude" },
     });
 
@@ -1893,45 +2504,11 @@ describe("updateSession()", () => {
     const session = api.sessions.get("s1");
 
     const applied = api.updateSessionMetadata("s1", {
-      claudeQuota: { claudeFiveHour: { usedPercent: "not-a-number" } },
+      contextUsage: { used: -5 },
     });
 
     assert.strictEqual(applied, false);
-    assert.strictEqual(session.claudeQuota, null);
-  });
-
-  it("updateSessionMetadata updates contextUsage and antigravityQuota too", () => {
-    update(api, { id: "antigravity:abc", state: "idle", agentId: "antigravity-cli" });
-
-    api.updateSessionMetadata("antigravity:abc", {
-      contextUsage: { used: 50000, limit: 1000000, percent: 5, source: "antigravity" },
-      antigravityQuota: { geminiWeekly: { usedPercent: 98, resetAt: 1738831180000 } },
-    });
-
-    const session = api.sessions.get("antigravity:abc");
-    assert.deepStrictEqual(session.contextUsage, { used: 50000, limit: 1000000, percent: 5, source: "antigravity" });
-    assert.deepStrictEqual(session.antigravityQuota, {
-      geminiWeekly: { usedPercent: 98, resetAt: 1738831180000 },
-    });
-  });
-
-  it("updateSessionMetadata broadcasts the refreshed snapshot (signature dedup applies)", () => {
-    const broadcasts = [];
-    const localApi = require("../src/state")(makeCtx({
-      broadcastSessionSnapshot: (snapshot) => broadcasts.push(snapshot),
-    }));
-    update(localApi, { id: "s1", state: "working" });
-    const before = broadcasts.length;
-
-    localApi.updateSessionMetadata("s1", {
-      claudeQuota: { claudeWeekly: { usedPercent: 41 } },
-    });
-
-    assert.ok(broadcasts.length > before, "quota change must broadcast a fresh snapshot");
-    localApi.updateSessionMetadata("s1", {
-      claudeQuota: { claudeWeekly: { usedPercent: 41 } },
-    });
-    assert.strictEqual(broadcasts.length, before + 1, "identical refresh must be deduped by signature");
+    assert.strictEqual(session.contextUsage, null);
   });
 
   it("updateSessionMetadata stamps metadataUpdatedAt on change only, never updatedAt", () => {
@@ -1940,30 +2517,30 @@ describe("updateSession()", () => {
     session.updatedAt = 12345;
 
     api.updateSessionMetadata("s1", {
-      claudeQuota: { claudeWeekly: { usedPercent: 41 } },
+      contextUsage: { used: 100, limit: 200000, percent: 0, source: "claude" },
     });
-    assert.ok(Number.isFinite(session.metadataUpdatedAt), "quota change must stamp metadataUpdatedAt");
+    assert.ok(Number.isFinite(session.metadataUpdatedAt), "telemetry change must stamp metadataUpdatedAt");
     assert.strictEqual(session.updatedAt, 12345);
 
     session.metadataUpdatedAt = 777; // pin so a re-stamp is detectable
     api.updateSessionMetadata("s1", {
-      claudeQuota: { claudeWeekly: { usedPercent: 41 } },
+      contextUsage: { used: 100, limit: 200000, percent: 0, source: "claude" },
     });
     assert.strictEqual(session.metadataUpdatedAt, 777, "identical refresh must not re-stamp");
   });
 
-  it("lifecycle events carry metadataUpdatedAt forward with the quota they preserve", () => {
+  it("lifecycle events carry metadataUpdatedAt forward with the telemetry they preserve", () => {
     update(api, { id: "s1", state: "working" });
     api.updateSessionMetadata("s1", {
-      claudeQuota: { claudeWeekly: { usedPercent: 41 } },
+      contextUsage: { used: 100, limit: 200000, percent: 0, source: "claude" },
     });
     api.sessions.get("s1").metadataUpdatedAt = 777; // pin to make loss detectable
 
     update(api, { id: "s1", state: "working", event: "PostToolUse" });
 
     const session = api.sessions.get("s1");
-    assert.deepStrictEqual(session.claudeQuota, { claudeWeekly: { usedPercent: 41 } });
-    assert.strictEqual(session.metadataUpdatedAt, 777, "hook-event rebuild must not drop the quota freshness stamp");
+    assert.deepStrictEqual(session.contextUsage, { used: 100, limit: 200000, percent: 0, source: "claude" });
+    assert.strictEqual(session.metadataUpdatedAt, 777, "hook-event rebuild must not drop the freshness stamp");
   });
 
   it("trims whitespace on sessionTitle", () => {
@@ -2155,7 +2732,11 @@ describe("buildSessionSnapshot", () => {
 
   it("returns a JSON-serializable empty snapshot", () => {
     const snapshot = api.buildSessionSnapshot();
-    assert.deepStrictEqual(snapshot, {
+    // Icon URLs are absolute file:// paths (machine-dependent) — assert the
+    // shape, then compare the rest exactly.
+    const { quotaAgentIcons, ...rest } = snapshot;
+    assert.deepStrictEqual(Object.keys(quotaAgentIcons).sort(), ["antigravityQuota", "claudeQuota", "codexQuota"]);
+    assert.deepStrictEqual(rest, {
       sessions: [],
       groups: [],
       orderedIds: [],
@@ -2165,6 +2746,8 @@ describe("buildSessionSnapshot", () => {
       hudLastTitle: null,
       lastSessionId: null,
       lastTitle: null,
+      accountQuota: [],
+      sessionAutomationOrphans: [],
     });
     assert.doesNotThrow(() => JSON.stringify(snapshot));
   });

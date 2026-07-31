@@ -86,7 +86,7 @@ my-theme/
 
 1. Start from `themes/template/`
 2. Choose whether you want eye tracking:
-   - `eyeTracking.enabled: true` → your `idle` asset must be SVG and include `#eyes-js`
+   - `eyeTracking.enabled: true` → every file in a state listed by `eyeTracking.states` must be SVG. In the template, `idle` is listed: only `states.idle[0]` follows the cursor and it must include the legacy `#eyes-js` target; put additional non-SVG idle visuals in `idleAnimations`
    - `eyeTracking.enabled: false` → idle can also be GIF / APNG / WebP / PNG / JPG / JPEG
 3. Create simple frame animations (4-12 frames) for other states using [Piskel](https://www.piskelapp.com/) (free, browser-based) or [Aseprite](https://www.aseprite.org/) (paid, pixel art pro tool)
 4. Export as APNG / WebP / GIF, or use single-frame PNG / JPG / JPEG for static poses
@@ -258,8 +258,46 @@ The existing schema fields are the only runtime truth. They already act as the t
 | `reactions` | Optional click/drag reaction block. Omit it to disable click and drag reactions entirely. |
 | `workingTiers` | Optional multi-session working overrides. Omit to fall back to `states.working[0]`. |
 | `jugglingTiers` | Optional subagent juggling overrides. Omit to fall back to `states.juggling[0]` if you provide that state. |
+| `customization.petTint` | Opts the theme into the app's built-in pet color filters. Omit it or set it to `false` when filters distort authored colors. Themes cannot provide custom CSS filter strings. |
+| `customization.accessories` | Opts the theme into Clawd's built-in accessory catalog only when every reachable visual has a deterministic attachment or an explicit hidden policy. |
 
 The loader also derives read-only metadata such as `idleMode` (`tracked` / `animated` / `static`) from these fields, but that metadata is not a second schema authority.
+
+#### Accessory attachments
+
+Accessories render outside the pet media, so they keep their own colors. Static attachments stay on the normal media channel; while a selected accessory uses `followTarget`, that SVG is rendered through the object channel so the external accessory layer can follow its animated target. A theme must provide complete attachment coverage before Settings exposes the accessory picker:
+
+```json
+"customization": {
+  "petTint": false,
+  "accessories": {
+    "default": {
+      "staticFrame": { "cx": 7.5, "baseY": 6.5, "width": 16 }
+    },
+    "mini": {
+      "staticFrame": { "cx": 7.5, "baseY": 6.5, "width": 16 }
+    },
+    "files": {
+      "idle.svg": {
+        "staticFrame": { "cx": 7.5, "baseY": 6.5, "width": 16 },
+        "followTarget": {
+          "id": "body-js",
+          "frame": { "cx": 7.5, "baseY": 6.5, "width": 16 }
+        }
+      },
+      "sleeping.png": { "visibility": "hidden" }
+    }
+  }
+}
+```
+
+- `staticFrame` uses the effective viewBox of that visual. `cx` is the head center, `baseY` is the accessory resting line, and `width` is the reference head width.
+- Accessory projection currently supports the SVG default `preserveAspectRatio="xMidYMid meet"` only (omitting the attribute has that default). Themes using `none`, `slice`, or another alignment must not opt into accessories until that projection mode is supported.
+- `default` covers root-viewBox files. `mini` covers mini-viewBox files. A file with its own `fileViewBoxes` entry needs an exact `files[basename]` descriptor.
+- `followTarget.id` is an exact SVG element id, not a CSS selector. Its `frame` coordinates are expressed in that target element's local SVG coordinate system, before the target's own and ancestor transforms. It is used only while that file renders through an accessible `<object>` document; `<img>`, PNG, APNG, GIF, and WebP use the required static fallback.
+- Use `{ "visibility": "hidden" }` for poses where an accessory should disappear, such as a covered sleeping pose. Do not combine `visibility` with placement fields.
+- Every reachable state, reaction, idle animation, tier, display hint, mini state, low-power override, update visual, and DND sleep transition must be covered. Incomplete or stale metadata makes the entire `accessories` capability false.
+- Themes choose attachment geometry only. They cannot add accessory files, URLs, scripts, selector heuristics, or custom renderer code.
 
 ### State Visual Fallback
 

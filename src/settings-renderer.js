@@ -24,6 +24,7 @@ function getTabIcon(tabId) {
 }
 
 function renderSidebar() {
+  document.title = core.helpers.t("settingsWindowTitle");
   const sidebar = document.getElementById("sidebar");
   if (!sidebar) return;
   sidebar.innerHTML = "";
@@ -99,6 +100,13 @@ if (window.settingsAPI && typeof window.settingsAPI.onChanged === "function") {
   window.settingsAPI.onChanged((payload) => core.ops.applyChanges(payload));
 }
 
+if (window.settingsAPI && typeof window.settingsAPI.onAgentActivity === "function") {
+  window.settingsAPI.onAgentActivity((payload) => {
+    const tab = core.tabs.agents;
+    if (tab && typeof tab.applyAgentActivity === "function") tab.applyAgentActivity(payload);
+  });
+}
+
 if (window.settingsAPI && typeof window.settingsAPI.onAnimationPreviewPosterReady === "function") {
   window.settingsAPI.onAnimationPreviewPosterReady((payload) => core.ops.applyAnimationPreviewPoster(payload));
 }
@@ -129,7 +137,29 @@ if (window.settingsAPI && typeof window.settingsAPI.getShortcutFailures === "fun
 }
 
 if (window.settingsAPI && typeof window.settingsAPI.getSnapshot === "function") {
-  window.settingsAPI.getSnapshot().then((snapshot) => {
+  const tintOptionsPromise =
+    typeof window.settingsAPI.getPetTintOptions === "function"
+      ? window.settingsAPI.getPetTintOptions().catch((err) => {
+        console.warn("settings: getPetTintOptions failed", err);
+        return [];
+      })
+      : Promise.resolve([]);
+  const accessoryOptionsPromise =
+    typeof window.settingsAPI.getPetAccessoryOptions === "function"
+      ? window.settingsAPI.getPetAccessoryOptions().catch((err) => {
+        console.warn("settings: getPetAccessoryOptions failed", err);
+        return [];
+      })
+      : Promise.resolve([]);
+  Promise.all([
+    window.settingsAPI.getSnapshot(),
+    tintOptionsPromise,
+    accessoryOptionsPromise,
+  ]).then(([snapshot, petTintOptions, petAccessoryOptions]) => {
+    core.runtime.petTintOptions = Array.isArray(petTintOptions) ? petTintOptions : [];
+    core.runtime.petAccessoryOptions = Array.isArray(petAccessoryOptions)
+      ? petAccessoryOptions
+      : [];
     core.ops.applyBootstrap(snapshot);
   });
 }

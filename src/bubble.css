@@ -337,6 +337,13 @@ body { padding: 6px; }
   }
 }
 
+/* Codex request_user_input preview — the options are a read-only echo of
+   what's on screen in Codex's own terminal, not a picker. Override the base
+   .option-item's pointer cursor so it doesn't look clickable. */
+.option-item-readonly {
+  cursor: default;
+}
+
 .option-item input {
   margin-top: 2px;
   accent-color: #d97757;
@@ -546,6 +553,13 @@ body { padding: 6px; }
     box-shadow: 4px 4px 0 #8f3f31, 7px 7px 0 rgba(0, 0, 0, 0.5);
   }
   .card.codex-notify.skin-pixel .header-title { text-shadow: 1px 1px 0 #000; }
+}
+
+.session-trust-error {
+  color: var(--deny-color);
+  font-size: 11px;
+  line-height: 1.35;
+  padding: 2px 4px;
 }
 
 /* ── Plan feedback form ── */

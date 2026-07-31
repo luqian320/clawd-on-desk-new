@@ -2,9 +2,11 @@
 
 const DefaultCodexSubagentClassifier = require("../agents/codex-subagent-classifier");
 const {
-  buildCodexMonitorUpdateOptions,
+  buildCodexMonitorSessionOptions,
+  normalizeCodexMonitorAccountQuotas,
   isCodexMonitorMetadataOnlyEvent,
 } = require("./codex-monitor-callback");
+const { makeSessionKey } = require("./session-key");
 
 const CODEX_OFFICIAL_LOG_SUPPRESS_TTL_MS = 10 * 60 * 1000;
 const CODEX_LOG_EVENTS_COVERED_BY_OFFICIAL_HOOKS = new Set([
@@ -38,6 +40,8 @@ function createAgentRuntimeMain(options = {}) {
   const captureGhosttyTerminalId = options.captureGhosttyTerminalId || null;
   const clearCodexNotifyBubbles = options.clearCodexNotifyBubbles || (() => {});
   const showCodexNotifyBubble = options.showCodexNotifyBubble || (() => {});
+  const showCodexUserInputBubble = options.showCodexUserInputBubble || (() => false);
+  const clearCodexUserInputBubbles = options.clearCodexUserInputBubbles || (() => {});
 
   let codexMonitor = null;
   const codexOfficialHookSessions = new Map();
@@ -122,8 +126,8 @@ function createAgentRuntimeMain(options = {}) {
     return server && typeof server[method] === "function" ? server[method](...args) : false;
   }
 
-  function syncIntegrationForAgent(agentId) {
-    return callServer("syncIntegrationForAgent", agentId);
+  function syncIntegrationForAgent(agentId, optionsArg) {
+    return callServer("syncIntegrationForAgent", agentId, optionsArg);
   }
 
   function repairIntegrationForAgent(agentId, optionsArg) {
@@ -172,53 +176,83 @@ function createAgentRuntimeMain(options = {}) {
       const CodexLogMonitor = loadCodexLogMonitor();
       const codexAgent = loadCodexAgent();
       codexMonitor = new CodexLogMonitor(codexAgent, (sid, state, event, extra) => {
+        const sessionId = makeSessionKey({ profileId: "local", rawSessionId: sid });
+        // Subscription quota is account state, not session state: it goes
+        // to the session-independent per-source store (null host = this
+        // machine), never into updateSession opts — see state.js
+        // updateAccountQuota and src/state-account-quota.js.
+        const sessionOptions = buildCodexMonitorSessionOptions(extra, {
+          includeHeadless: true,
+        });
+        const accountQuotas = normalizeCodexMonitorAccountQuotas(extra);
+        const annotateCodexAccountQuota = () => {
+          if (!accountQuotas) return;
+          const stateRuntime = getStateRuntime();
+          if (stateRuntime && typeof stateRuntime.updateAccountQuota === "function") {
+            stateRuntime.updateAccountQuota(null, accountQuotas);
+          }
+        };
         if (extra && extra.desktopApprovalRequested === true) {
-          updateSession(sid, state, event, buildCodexMonitorUpdateOptions(extra, {
-            includeHeadless: true,
-          }));
+          updateSession(sessionId, state, event, sessionOptions);
+          annotateCodexAccountQuota();
           showCodexNotifyBubble({
-            sessionId: sid,
+            sessionId,
             command: extra.desktopApprovalReason || "",
             sticky: true,
           });
           return;
         }
         if (extra && extra.desktopApprovalResolved === true) {
-          clearCodexNotifyBubbles(sid, "codex-desktop-approval-resolved");
-          updateSession(sid, state, event, buildCodexMonitorUpdateOptions(extra, {
-            includeHeadless: true,
-          }));
+          clearCodexNotifyBubbles(sessionId, "codex-desktop-approval-resolved");
+          updateSession(sessionId, state, event, sessionOptions);
+          annotateCodexAccountQuota();
           return;
         }
         if (isCodexMonitorMetadataOnlyEvent(event, extra)) {
-          const metadataOptions = buildCodexMonitorUpdateOptions(extra, {
-            includeHeadless: true,
-          });
-          if (metadataOptions.contextUsage) {
-            updateSession(sid, state, event, {
-              ...metadataOptions,
+          if (sessionOptions.contextUsage) {
+            updateSession(sessionId, state, event, {
+              ...sessionOptions,
               preserveState: true,
             });
           }
+          annotateCodexAccountQuota();
           return;
         }
-        if (shouldSuppressCodexLogEvent(sid, state, event)) {
-          const metadataOptions = buildCodexMonitorUpdateOptions(extra, {
-            includeHeadless: true,
-          });
-          if (metadataOptions.contextUsage) {
-            updateSession(sid, state, event, {
-              ...metadataOptions,
+        if (shouldSuppressCodexLogEvent(sessionId, state, event)) {
+          if (sessionOptions.contextUsage) {
+            updateSession(sessionId, state, event, {
+              ...sessionOptions,
               preserveState: true,
             });
           }
+          annotateCodexAccountQuota();
           return;
         }
-        clearCodexNotifyBubbles(sid, `codex-state-transition:${state}`);
-        updateSession(sid, state, event, buildCodexMonitorUpdateOptions(extra, {
-          includeHeadless: true,
-        }));
-      }, { classifier: codexSubagentClassifier });
+        clearCodexNotifyBubbles(sessionId, `codex-state-transition:${state}`);
+        updateSession(sessionId, state, event, sessionOptions);
+        annotateCodexAccountQuota();
+      }, {
+        classifier: codexSubagentClassifier,
+        onUserInputRequest: (sid, request, extra) => {
+          const sessionId = makeSessionKey({ profileId: "local", rawSessionId: sid });
+          const shown = showCodexUserInputBubble({
+            sessionId,
+            callId: request.callId,
+            questions: request.questions,
+            autoResolutionMs: request.autoResolutionMs,
+            ...extra,
+          });
+          if (!shown) return;
+          updateSession(sessionId, "notification", "CodexUserInputRequest", {
+            ...buildCodexMonitorSessionOptions(extra, { includeHeadless: true }),
+            transientPermissionEvent: true,
+          });
+        },
+        onUserInputResolved: (sid, callId) => {
+          const sessionId = makeSessionKey({ profileId: "local", rawSessionId: sid });
+          clearCodexUserInputBubbles(sessionId, callId, "codex-user-input-resolved");
+        },
+      });
       if (isAgentEnabled("codex")) {
         codexMonitor.start();
       }

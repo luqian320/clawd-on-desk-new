@@ -93,6 +93,13 @@ function createThemeContext(theme, options = {}) {
       eyeTrackingStates: theme.eyeTracking.enabled ? theme.eyeTracking.states : [],
       trustedScriptedSvgFiles: [...trustedScriptedSvgFiles],
       rendering: theme.rendering || { svgChannel: "auto" },
+      petTintSupported: !!(theme._capabilities && theme._capabilities.petTint),
+      accessorySupported: !!(theme._capabilities && theme._capabilities.accessories),
+      accessoryAttachments: (
+        theme._capabilities
+        && theme._capabilities.accessories
+        && theme.customization
+      ) ? (theme.customization.accessories || null) : null,
       objectScale: theme.objectScale,
       transitions: theme.transitions || {},
     };

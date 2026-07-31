@@ -10,6 +10,10 @@ const {
   registerCodexHooks,
   unregisterCodexHooks,
 } = require("../hooks/codex-install");
+const {
+  CODEX_WSL_INTEROP_ARG,
+  materializeAppImageHookScript,
+} = require("../hooks/codex-install-utils");
 const { CODEX_DEBUG_HOOK_EVENTS, registerCodexDebugHooks } = require("../hooks/codex-debug-install");
 
 const MARKER = "codex-hook.js";
@@ -41,6 +45,83 @@ afterEach(() => {
 });
 
 describe("Codex official hook installer", () => {
+  it("materializes AppImage hook closure outside the transient FUSE mount", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-appimage-hook-"));
+    tempDirs.push(tmpDir);
+    const sourceDir = path.join(tmpDir, ".mount_Clawd", "hooks");
+    const materializedRoot = path.join(tmpDir, "stable-hooks");
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, "entry.js"), 'require("./dep");\n', "utf8");
+    fs.writeFileSync(path.join(sourceDir, "dep.js"), 'require("node:path");\n', "utf8");
+    fs.writeFileSync(path.join(sourceDir, "runtime-helper.js"), 'require("./runtime-dep");\n', "utf8");
+    fs.writeFileSync(path.join(sourceDir, "runtime-dep.js"), 'module.exports = true;\n', "utf8");
+
+    const target = materializeAppImageHookScript(path.join(sourceDir, "entry.js"), {
+      appImagePath: "/opt/Clawd-on-Desk.AppImage",
+      materializedRoot,
+      extraEntryPaths: [path.join(sourceDir, "runtime-helper.js")],
+    });
+
+    assert.ok(target.startsWith(`${materializedRoot}${path.sep}`));
+    assert.ok(!target.includes(".mount_Clawd"));
+    assert.strictEqual(fs.readFileSync(target, "utf8"), 'require("./dep");\n');
+    assert.strictEqual(fs.readFileSync(path.join(path.dirname(target), "dep.js"), "utf8"), 'require("node:path");\n');
+    assert.strictEqual(
+      fs.readFileSync(path.join(path.dirname(target), "runtime-helper.js"), "utf8"),
+      'require("./runtime-dep");\n'
+    );
+    assert.strictEqual(
+      fs.readFileSync(path.join(path.dirname(target), "runtime-dep.js"), "utf8"),
+      "module.exports = true;\n"
+    );
+    assert.strictEqual(
+      fs.readFileSync(path.join(path.dirname(target), ".clawd-appimage-path"), "utf8"),
+      "/opt/Clawd-on-Desk.AppImage\n"
+    );
+    assert.strictEqual(materializeAppImageHookScript(path.join(sourceDir, "entry.js"), {
+      appImagePath: "/opt/Clawd-on-Desk.AppImage",
+      materializedRoot,
+      extraEntryPaths: [path.join(sourceDir, "runtime-helper.js")],
+    }), target);
+
+    fs.rmSync(path.join(path.dirname(target), "runtime-helper.js"));
+    assert.strictEqual(materializeAppImageHookScript(path.join(sourceDir, "entry.js"), {
+      appImagePath: "/opt/Clawd-on-Desk.AppImage",
+      materializedRoot,
+      extraEntryPaths: [path.join(sourceDir, "runtime-helper.js")],
+    }), target);
+    assert.ok(fs.existsSync(path.join(path.dirname(target), "runtime-helper.js")));
+  });
+
+  it("registers an AppImage Codex hook from the materialized stable path", () => {
+    const codexDir = makeTempCodexDir({});
+    const materializedRoot = path.join(path.dirname(codexDir), "stable-hooks");
+    registerCodexHooks({
+      silent: true,
+      codexDir,
+      nodeBin: "/usr/bin/node",
+      platform: "linux",
+      processEnv: { APPIMAGE: "/opt/Clawd-on-Desk.AppImage" },
+      materializedRoot,
+    });
+
+    const command = readJson(path.join(codexDir, "hooks.json"))
+      .hooks.SessionStart[0].hooks[0].command;
+    assert.ok(command.includes(materializedRoot));
+    assert.ok(!command.includes("app.asar.unpacked"));
+    const markerMatches = [...command.matchAll(/"([^"]*codex-hook\.js)"/g)];
+    assert.strictEqual(markerMatches.length, 1);
+    const stableHook = markerMatches[0][1];
+    assert.ok(fs.existsSync(stableHook));
+    const stableAutoStart = path.join(path.dirname(stableHook), "auto-start.js");
+    assert.ok(fs.existsSync(stableAutoStart));
+    assert.doesNotThrow(() => require(stableAutoStart));
+    assert.strictEqual(
+      fs.readFileSync(path.join(path.dirname(stableHook), ".clawd-appimage-path"), "utf8"),
+      "/opt/Clawd-on-Desk.AppImage\n"
+    );
+  });
+
   it("registers official hook events on fresh install including PermissionRequest", () => {
     const codexDir = makeTempCodexDir({});
     const result = registerCodexHooks({
@@ -174,6 +255,7 @@ describe("Codex official hook installer", () => {
       nodeBin: "/usr/local/bin/node",
       platform: "linux",
       remote: true,
+      sshRemote: true,
     });
 
     assert.strictEqual(result.added, CODEX_OFFICIAL_HOOK_EVENTS.length);
@@ -181,8 +263,24 @@ describe("Codex official hook installer", () => {
     const command = settings.hooks.SessionStart[0].hooks[0].command;
     assert.strictEqual(
       command,
-      "CLAWD_REMOTE='1' \"/usr/local/bin/node\" \"" + path.resolve(__dirname, "..", "hooks", "codex-hook.js").replace(/\\/g, "/") + "\""
+      "CLAWD_REMOTE='1' CLAWD_SSH_REMOTE='1' \"/usr/local/bin/node\" \"" + path.resolve(__dirname, "..", "hooks", "codex-hook.js").replace(/\\/g, "/") + "\""
     );
+  });
+
+  it("keeps legacy WSL --remote on CLAWD_REMOTE without the SSH secure marker", () => {
+    const codexDir = makeTempCodexDir({});
+    registerCodexHooks({
+      silent: true,
+      codexDir,
+      nodeBin: "/usr/local/bin/node",
+      platform: "linux",
+      remote: true,
+      processEnv: {},
+    });
+    const command = readJson(path.join(codexDir, "hooks.json"))
+      .hooks.SessionStart[0].hooks[0].command;
+    assert.match(command, /^CLAWD_REMOTE='1' /);
+    assert.doesNotMatch(command, /CLAWD_SSH_REMOTE|CLAWD_REMOTE_IDENTITY_PATH/);
   });
 
   it("registers Windows remote hooks with a PowerShell env prefix on commandWindows only", () => {
@@ -193,6 +291,7 @@ describe("Codex official hook installer", () => {
       nodeBin: "C:\\node.exe",
       platform: "win32",
       remote: true,
+      sshRemote: true,
     });
 
     assert.strictEqual(result.added, CODEX_OFFICIAL_HOOK_EVENTS.length);
@@ -202,11 +301,11 @@ describe("Codex official hook installer", () => {
     // PowerShell env prefix lives on commandWindows (what Windows codex runs).
     assert.strictEqual(
       hook.commandWindows,
-      `$env:CLAWD_REMOTE='1'; & "C:\\node.exe" "${hookScript}"`
+      `$env:CLAWD_REMOTE='1'; $env:CLAWD_SSH_REMOTE='1'; & "C:\\node.exe" "${hookScript}"`
     );
     // The POSIX command must NOT carry an env prefix: env vars don't cross
     // the WSL interop boundary, so a prefix would only mislead readers.
-    assert.strictEqual(hook.command, `"/mnt/c/node.exe" "${hookScript}"`);
+    assert.strictEqual(hook.command, `"/mnt/c/node.exe" "${hookScript}" ${CODEX_WSL_INTEROP_ARG}`);
     assert.ok(result.warnings.some((w) => /interop/.test(w)));
   });
 
@@ -329,11 +428,11 @@ describe("Codex hooks on a Windows host write dual command fields (#544)", () =>
   it("builds the interop command from a bare node bin by appending .exe", () => {
     assert.strictEqual(
       buildCodexHookPosixInteropCommand("node", "D:/x/codex-hook.js"),
-      '"node.exe" "D:/x/codex-hook.js"'
+      `"node.exe" "D:/x/codex-hook.js" ${CODEX_WSL_INTEROP_ARG}`
     );
     assert.strictEqual(
       buildCodexHookPosixInteropCommand("node.exe", "D:/x/codex-hook.js"),
-      '"node.exe" "D:/x/codex-hook.js"'
+      `"node.exe" "D:/x/codex-hook.js" ${CODEX_WSL_INTEROP_ARG}`
     );
   });
 
@@ -356,7 +455,7 @@ describe("Codex hooks on a Windows host write dual command fields (#544)", () =>
       );
       assert.strictEqual(
         hook.command,
-        `"/mnt/c/Program Files/nodejs/node.exe" "${HOOK_SCRIPT}"`
+        `"/mnt/c/Program Files/nodejs/node.exe" "${HOOK_SCRIPT}" ${CODEX_WSL_INTEROP_ARG}`
       );
     }
   });
@@ -397,7 +496,7 @@ describe("Codex hooks on a Windows host write dual command fields (#544)", () =>
     // commandWindows takes over the exact PowerShell form command used to
     // hold, so Windows codex resolves the same string (trusted_hash intact).
     assert.strictEqual(hook.commandWindows, legacyCommand);
-    assert.strictEqual(hook.command, `"node.exe" "${HOOK_SCRIPT}"`);
+    assert.strictEqual(hook.command, `"node.exe" "${HOOK_SCRIPT}" ${CODEX_WSL_INTEROP_ARG}`);
     assert.strictEqual(settings.hooks.SessionStart.length, 1);
   });
 
@@ -425,7 +524,7 @@ describe("Codex hooks on a Windows host write dual command fields (#544)", () =>
     const settings = readJson(path.join(codexDir, "hooks.json"));
     const hook = settings.hooks.SessionStart[0].hooks[0];
     assert.strictEqual(hook.commandWindows, `& "E:\\custom\\node.exe" "${HOOK_SCRIPT}"`);
-    assert.strictEqual(hook.command, `"/mnt/e/custom/node.exe" "${HOOK_SCRIPT}"`);
+    assert.strictEqual(hook.command, `"/mnt/e/custom/node.exe" "${HOOK_SCRIPT}" ${CODEX_WSL_INTEROP_ARG}`);
   });
 
   it("does not extract the derived /mnt interop path back as a node bin", () => {
@@ -449,7 +548,7 @@ describe("Codex hooks on a Windows host write dual command fields (#544)", () =>
     const settings = readJson(path.join(codexDir, "hooks.json"));
     const hook = settings.hooks.SessionStart[0].hooks[0];
     assert.strictEqual(hook.commandWindows, `& "C:\\tools\\node.exe" "${HOOK_SCRIPT}"`);
-    assert.strictEqual(hook.command, `"/mnt/c/tools/node.exe" "${HOOK_SCRIPT}"`);
+    assert.strictEqual(hook.command, `"/mnt/c/tools/node.exe" "${HOOK_SCRIPT}" ${CODEX_WSL_INTEROP_ARG}`);
   });
 
   it("POSIX installs never write commandWindows", () => {
@@ -530,11 +629,11 @@ describe("Codex hooks on a Windows host write dual command fields (#544)", () =>
   it("falls back to bare node.exe for a UNC node path in the interop command", () => {
     assert.strictEqual(
       buildCodexHookPosixInteropCommand("\\\\server\\share\\node.exe", "D:/x/codex-hook.js"),
-      '"node.exe" "D:/x/codex-hook.js"'
+      `"node.exe" "D:/x/codex-hook.js" ${CODEX_WSL_INTEROP_ARG}`
     );
     assert.strictEqual(
       buildCodexHookPosixInteropCommand("//server/share/node.exe", "D:/x/codex-hook.js"),
-      '"node.exe" "D:/x/codex-hook.js"'
+      `"node.exe" "D:/x/codex-hook.js" ${CODEX_WSL_INTEROP_ARG}`
     );
   });
 

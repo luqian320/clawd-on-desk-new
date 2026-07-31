@@ -103,13 +103,102 @@ test("requestElicitation resolves elicitation-submit when a single-select questi
 
   releaseFirstPoll({ ok: true, result: [] });
   const decision = await decisionPromise;
-  assert.deepEqual(decision, { type: "elicitation-submit", answers: { "Pick A or B": "A" } });
+  assert.deepEqual(decision, { type: "elicitation-submit", answers: { "0": "A" } });
 
   await tick();
   const edit = server.calls.find((call) => call.method === "editMessageText");
   assert.ok(edit, "answering the last question rewrites the card with a submitted status");
   assert.match(edit.payload.text, /Submitted/);
   assert.equal(edit.payload.reply_markup, undefined);
+
+  await runner.stop();
+});
+
+test("requestElicitation keeps the server-normalized single-select value while compacting only the button text", async () => {
+  const server = createFakeTelegramServer();
+  let releaseFirstPoll;
+  let optionData = "";
+  let buttonText = "";
+  const fullLabel = "Refactor the module  \r\nbefore\u0007adding another integration layer";
+
+  server.enqueue("getUpdates", () => new Promise((resolve) => { releaseFirstPoll = resolve; }));
+  server.enqueue("sendMessage", (payload) => {
+    buttonText = payload.reply_markup.inline_keyboard[0][0].text;
+    optionData = payload.reply_markup.inline_keyboard[0][0].callback_data;
+    return { ok: true, result: { message_id: 551, chat: { id: 123 } } };
+  });
+  server.enqueue("getUpdates", () => ({
+    ok: true,
+    result: [callbackUpdate({ id: 1, messageId: 551, fromId: 777, data: optionData })],
+  }));
+  server.enqueueOk("answerCallbackQuery", true);
+  server.enqueueOk("editMessageText", { message_id: 551 });
+
+  const runner = makeRunner(server);
+  await runner.start();
+  await tick();
+  const decisionPromise = runner.requestElicitation({
+    title: "claude-code needs input",
+    questions: [{ question: "Choose a plan", options: [{ label: fullLabel }] }],
+  });
+  await tick();
+
+  assert.equal(buttonText.length, 32);
+  assert.notEqual(buttonText, fullLabel);
+  assert.doesNotMatch(buttonText, /\r|\u0007| {2}\n/);
+  assert.match(buttonText, /\.\.\.$/);
+
+  releaseFirstPoll({ ok: true, result: [] });
+  assert.deepEqual(await decisionPromise, {
+    type: "elicitation-submit",
+    answers: { "0": fullLabel },
+  });
+
+  await runner.stop();
+});
+
+test("requestElicitation redacts secrets from the displayed question and returns an indexed answer", async () => {
+  const server = createFakeTelegramServer();
+  let releaseFirstPoll;
+  let sentText = "";
+  let optionData = "";
+
+  server.enqueue("getUpdates", () => new Promise((resolve) => { releaseFirstPoll = resolve; }));
+  server.enqueue("sendMessage", (payload) => {
+    sentText = payload.text;
+    optionData = payload.reply_markup.inline_keyboard[0][0].callback_data;
+    return { ok: true, result: { message_id: 601, chat: { id: 123 } } };
+  });
+  server.enqueue("getUpdates", () => ({
+    ok: true,
+    result: [callbackUpdate({ id: 1, messageId: 601, fromId: 777, data: optionData })],
+  }));
+  server.enqueueOk("answerCallbackQuery", true);
+  server.enqueueOk("editMessageText", { message_id: 601 });
+
+  const runner = makeRunner(server);
+  await runner.start();
+  await tick();
+  const decisionPromise = runner.requestElicitation({
+    title: "claude-code needs input",
+    questions: [
+      { question: "Rotate sk-abcdefghijklmnop1234 from .env?", options: [{ label: "Yes" }, { label: "No" }] },
+    ],
+  });
+  await tick();
+
+  // The card text sent to Telegram must not carry the key the agent quoted...
+  assert.doesNotMatch(sentText, /sk-abcdefghijklmnop1234/);
+  assert.match(sentText, /redacted:token/);
+
+  releaseFirstPoll({ ok: true, result: [] });
+  const decision = await decisionPromise;
+  // The permission layer owns the index -> raw question remap, so the runner
+  // never needs to use redacted display text as an answer key.
+  assert.deepEqual(decision, {
+    type: "elicitation-submit",
+    answers: { "0": "Yes" },
+  });
 
   await runner.stop();
 });
@@ -165,7 +254,68 @@ test("requestElicitation advances through multiple questions and submits once al
   const decision = await decisionPromise;
   assert.deepEqual(decision, {
     type: "elicitation-submit",
-    answers: { "Pick A or B": "A", "Pick C or D": "C" },
+    answers: { "0": "A", "1": "C" },
+  });
+
+  await runner.stop();
+});
+
+test("requestElicitation keys answers by original question index even when the display text is clamped", async () => {
+  const server = createFakeTelegramServer();
+  let releaseFirstPoll;
+  let q1Data = "";
+  let q2Data = "";
+
+  // Q1 blows past the 240-char display clamp; Q2 carries \r\n and trailing
+  // whitespace that compactMessageText rewrites. Neither display string can
+  // round-trip to the original toolInput text - which is exactly why the
+  // submitted answers must be keyed by question index, not question text.
+  const longQuestion = `Pick one: ${"x".repeat(300)}`;
+  const crlfQuestion = "Line one\r\nLine two  ";
+  const payload = {
+    title: "claude-code needs input",
+    questions: [
+      { question: longQuestion, options: [{ label: "A" }, { label: "B" }] },
+      { question: crlfQuestion, options: [{ label: "C" }, { label: "D" }] },
+    ],
+  };
+
+  server.enqueue("getUpdates", () => new Promise((resolve) => { releaseFirstPoll = resolve; }));
+  server.enqueue("sendMessage", (msg) => {
+    q1Data = msg.reply_markup.inline_keyboard[0][0].callback_data;
+    return { ok: true, result: { message_id: 701, chat: { id: 123 } } };
+  });
+  server.enqueue("getUpdates", () => ({
+    ok: true,
+    result: [callbackUpdate({ id: 1, messageId: 701, fromId: 777, data: q1Data })],
+  }));
+  server.enqueueOk("answerCallbackQuery", true);
+  server.enqueue("editMessageText", (edit) => {
+    q2Data = edit.reply_markup.inline_keyboard[0][0].callback_data;
+    return { ok: true, result: { message_id: 701 } };
+  });
+  server.enqueue("getUpdates", () => ({
+    ok: true,
+    result: [callbackUpdate({ id: 2, messageId: 701, fromId: 777, data: q2Data })],
+  }));
+  server.enqueueOk("answerCallbackQuery", true);
+  server.enqueueOk("editMessageText", { message_id: 701 });
+
+  const runner = makeRunner(server);
+  await runner.start();
+  await tick();
+  const decisionPromise = runner.requestElicitation(payload);
+  await tick();
+
+  releaseFirstPoll({ ok: true, result: [] });
+  await tick();
+  await tick();
+  await tick();
+
+  const decision = await decisionPromise;
+  assert.deepEqual(decision, {
+    type: "elicitation-submit",
+    answers: { "0": "A", "1": "C" },
   });
 
   await runner.stop();
@@ -201,7 +351,7 @@ test("requestElicitation still renders the card when a tap races ahead of the se
 
   releaseFirstPoll({ ok: true, result: [] });
   const decision = await decisionPromise;
-  assert.deepEqual(decision, { type: "elicitation-submit", answers: { "Pick A or B": "A" } });
+  assert.deepEqual(decision, { type: "elicitation-submit", answers: { "0": "A" } });
 
   await tick();
   const edit = server.calls.find((call) => call.method === "editMessageText");
@@ -271,21 +421,24 @@ test("requestElicitation's back button re-renders the previous question without 
   await runner.stop();
 });
 
-test("requestElicitation requires Confirm selection before advancing a multi-select question", async () => {
+test("requestElicitation requires Confirm and preserves the server-normalized multi-select value", async () => {
   const server = createFakeTelegramServer();
   let releaseFirstPoll;
   let optionAData = "";
+  let optionAButtonText = "";
   let confirmData = "";
+  const fullLabel = "Refactor the module  \r\nbefore\u0007adding another integration layer";
 
   const payload = {
     title: "claude-code needs input",
     questions: [
-      { question: "Pick your toppings", multiSelect: true, options: [{ label: "Cheese" }, { label: "Olives" }] },
+      { question: "Pick your changes", multiSelect: true, options: [{ label: fullLabel }, { label: "Update tests" }] },
     ],
   };
 
   server.enqueue("getUpdates", () => new Promise((resolve) => { releaseFirstPoll = resolve; }));
   server.enqueue("sendMessage", (msg) => {
+    optionAButtonText = msg.reply_markup.inline_keyboard[0][0].text;
     optionAData = msg.reply_markup.inline_keyboard[0][0].callback_data;
     confirmData = msg.reply_markup.inline_keyboard.flat().find((btn) => btn.callback_data.includes(":c0")).callback_data;
     return { ok: true, result: { message_id: 801, chat: { id: 123 } } };
@@ -300,6 +453,7 @@ test("requestElicitation requires Confirm selection before advancing a multi-sel
     // without resolving or advancing.
     assert.match(edit.text, /Question 1\/1/);
     assert.match(edit.reply_markup.inline_keyboard[0][0].text, /^☑/);
+    assert.equal(edit.reply_markup.inline_keyboard[0][0].text.length, 32);
     return { ok: true, result: { message_id: 801 } };
   });
   server.enqueue("getUpdates", () => ({
@@ -314,6 +468,9 @@ test("requestElicitation requires Confirm selection before advancing a multi-sel
   await tick();
   const decisionPromise = runner.requestElicitation(payload);
   await tick();
+  assert.equal(optionAButtonText.length, 32);
+  assert.notEqual(optionAButtonText, fullLabel);
+  assert.doesNotMatch(optionAButtonText, /\r|\u0007| {2}\n/);
 
   releaseFirstPoll({ ok: true, result: [] });
   await tick();
@@ -323,7 +480,7 @@ test("requestElicitation requires Confirm selection before advancing a multi-sel
   const decision = await decisionPromise;
   assert.deepEqual(decision, {
     type: "elicitation-submit",
-    answers: { "Pick your toppings": "Cheese" },
+    answers: { "0": fullLabel },
   });
 
   await runner.stop();
@@ -368,7 +525,7 @@ test("requestElicitation answers the active question from a text reply after tap
   const decision = await decisionPromise;
   assert.deepEqual(decision, {
     type: "elicitation-submit",
-    answers: { "Pick A or B": "My custom answer" },
+    answers: { "0": "My custom answer" },
   });
 
   await runner.stop();
@@ -467,52 +624,32 @@ test("requestElicitation still answers an Other reply that looks like a slash co
   const decision = await decisionPromise;
   assert.deepEqual(decision, {
     type: "elicitation-submit",
-    answers: { "Pick A or B": "/tmp/output.log" },
+    answers: { "0": "/tmp/output.log" },
   });
 
   await runner.stop();
 });
 
-test("requestElicitation fails closed (not open) when allowedUser is unset - both a tap and an Other reply are rejected", async () => {
+test("requestElicitation does not send a card when allowedUser is unset (fail-closed)", async () => {
   const server = createFakeTelegramServer();
-  let releaseFirstPoll;
-  let optionData = "";
+  let sendCalled = false;
 
-  server.enqueue("getUpdates", () => new Promise((resolve) => { releaseFirstPoll = resolve; }));
-  server.enqueue("sendMessage", (msg) => {
-    optionData = msg.reply_markup.inline_keyboard[0][0].callback_data;
+  server.enqueue("getUpdates", () => new Promise(() => {})); // hold the poll open
+  server.enqueue("sendMessage", () => {
+    sendCalled = true;
     return { ok: true, result: { message_id: 1301, chat: { id: 123 } } };
   });
-  // Unlike the approval flow's "unset allowedUser skips the check" convention,
-  // an elicitation answer must not be acceptable from just anyone in the chat
-  // when allowedUser is blank (misconfigured) - it feeds straight back into
-  // the agent's next step.
-  server.enqueue("getUpdates", () => ({
-    ok: true,
-    result: [callbackUpdate({ id: 1, messageId: 1301, fromId: 555, data: optionData })],
-  }));
-  server.enqueueOk("answerCallbackQuery", true);
-  server.enqueue("getUpdates", () => ({
-    ok: true,
-    result: [textUpdate({ id: 2, fromId: 555, text: "should also be rejected", replyToMessageId: 1301 })],
-  }));
 
   const runner = makeRunner(server, { getAllowedUserId: () => "" });
   await runner.start();
   await tick();
-  const decisionPromise = runner.requestElicitation(singleQuestionPayload());
-  await tick();
-
-  releaseFirstPoll({ ok: true, result: [] });
-  await tick();
-  await tick();
-  await tick();
-
-  let resolved = false;
-  decisionPromise.then(() => { resolved = true; });
-  await tick();
-  assert.equal(resolved, false, "neither the tap nor the Other-style reply may answer the question when allowedUser is unset");
-
+  // An elicitation answer feeds straight into the agent's next step, so a blank
+  // (misconfigured) allowedUser must not send an actionable card at all — it
+  // fails closed at the entry and resolves to no-decision. (Rejection of a tap
+  // from a DIFFERENT user is covered by the next test, where allowedUser is set.)
+  const decision = await runner.requestElicitation(singleQuestionPayload());
+  assert.equal(decision, null, "a blank allowedUser resolves to no-decision");
+  assert.equal(sendCalled, false, "no elicitation card is sent");
   await runner.stop();
 });
 

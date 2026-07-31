@@ -67,6 +67,50 @@ describe("updateRegistry pure-data validators", () => {
     assert.strictEqual(updateRegistry.miniEdge("top", deps).status, "error");
   });
 
+  it("petTint accepts only safe per-theme catalog selections", () => {
+    const deps = { snapshot: baseSnapshot };
+    assert.strictEqual(updateRegistry.petTint({}, deps).status, "ok");
+    assert.strictEqual(
+      updateRegistry.petTint({ clawd: "gold", cloudling: "matcha" }, deps).status,
+      "ok"
+    );
+    assert.strictEqual(updateRegistry.petTint({ clawd: "none" }, deps).status, "error");
+    assert.strictEqual(updateRegistry.petTint({ clawd: "custom" }, deps).status, "error");
+    assert.strictEqual(
+      updateRegistry.petTint({ "../unsafe": "gold" }, deps).status,
+      "error"
+    );
+    assert.strictEqual(
+      updateRegistry.petTint({ clawd: "url(file:///secret)" }, deps).status,
+      "error"
+    );
+    assert.strictEqual(updateRegistry.petTint("gold", deps).status, "error");
+    assert.strictEqual(updateRegistry.petTint([], deps).status, "error");
+    assert.strictEqual(updateRegistry.petTint(null, deps).status, "error");
+  });
+
+  it("petAccessory accepts only safe per-theme catalog selections", () => {
+    const deps = { snapshot: baseSnapshot };
+    assert.strictEqual(updateRegistry.petAccessory({}, deps).status, "ok");
+    assert.strictEqual(
+      updateRegistry.petAccessory({ clawd: "wizard-hat", cloudling: "halo" }, deps).status,
+      "ok"
+    );
+    assert.strictEqual(updateRegistry.petAccessory({ clawd: "none" }, deps).status, "error");
+    assert.strictEqual(updateRegistry.petAccessory({ clawd: "seasonal" }, deps).status, "error");
+    assert.strictEqual(
+      updateRegistry.petAccessory({ "../unsafe": "halo" }, deps).status,
+      "error"
+    );
+    assert.strictEqual(
+      updateRegistry.petAccessory({ clawd: "file:///secret.svg" }, deps).status,
+      "error"
+    );
+    assert.strictEqual(updateRegistry.petAccessory("wizard-hat", deps).status, "error");
+    assert.strictEqual(updateRegistry.petAccessory([], deps).status, "error");
+    assert.strictEqual(updateRegistry.petAccessory(null, deps).status, "error");
+  });
+
   it("x/y/preMiniX/preMiniY require finite numbers", () => {
     const deps = { snapshot: baseSnapshot };
     assert.strictEqual(updateRegistry.x(0, deps).status, "ok");
@@ -78,11 +122,12 @@ describe("updateRegistry pure-data validators", () => {
   it("function-form boolean fields reject non-booleans", () => {
     const deps = { snapshot: baseSnapshot };
     for (const key of [
-      "sessionHudEnabled", "sessionHudShowElapsed", "sessionHudShowContextUsage", "sessionHudCleanupDetached",
+      "sessionHudEnabled", "sessionHudShowElapsed", "sessionHudShowContextUsage", "sessionHudShowQuota", "sessionHudCleanupDetached",
       "sessionHudShowStateLabels", "sessionHudPinned",
       "miniMode", "openAtLoginHydrated", "soundMuted", "bubbleFollowPet",
       "hideBubbles", "permissionBubblesEnabled", "lowPowerIdleMode",
       "allowEdgePinning", "disableMiniMode", "keepSizeAcrossDisplays", "codexHookHealthNotifyEnabled",
+      "quotaMergeSources",
     ]) {
       assert.strictEqual(updateRegistry[key](true, deps).status, "ok", `${key}(true)`);
       assert.strictEqual(updateRegistry[key](false, deps).status, "ok", `${key}(false)`);
@@ -96,6 +141,22 @@ describe("updateRegistry pure-data validators", () => {
     assert.strictEqual(updateRegistry.codexHookHealthLastNotified("needs-review", deps).status, "ok");
     assert.strictEqual(updateRegistry.codexHookHealthLastNotified(null, deps).status, "error");
     assert.strictEqual(updateRegistry.codexHookHealthLastNotified(42, deps).status, "error");
+  });
+
+  it("Claude quota collection validates booleans and delegates the opt-in mutation", async () => {
+    const entry = updateRegistry.claudeQuotaCollectionEnabled;
+    assert.strictEqual(entry.validate(true).status, "ok");
+    assert.strictEqual(entry.validate("yes").status, "error");
+    const calls = [];
+    const enabled = await entry.effect(true, {
+      setClaudeQuotaCollectionEnabled: async (value) => {
+        calls.push(value);
+        return { status: "ok" };
+      },
+    });
+    assert.strictEqual(enabled.status, "ok");
+    assert.deepStrictEqual(calls, [true]);
+    assert.strictEqual(entry.effect(false, {}).status, "error");
   });
 
   it("bubble auto-close seconds require integers in range", () => {
@@ -308,27 +369,29 @@ describe("updateRegistry pure-data validators", () => {
 });
 
 describe("object-form effects (autoStartWithClaude / manageClaudeHooksAutomatically / openAtLogin)", () => {
-  it("autoStartWithClaude effect calls installAutoStart on true", () => {
+  it("autoStartWithClaude effect calls installAutoStart on true", async () => {
+    // installAutoStart/uninstallAutoStart go through the server-owned Claude
+    // hook operation queue (#657) and now return a Promise.
     let installCalls = 0;
     let uninstallCalls = 0;
     const deps = {
       installAutoStart: () => installCalls++,
       uninstallAutoStart: () => uninstallCalls++,
     };
-    const r = updateRegistry.autoStartWithClaude.effect(true, deps);
+    const r = await updateRegistry.autoStartWithClaude.effect(true, deps);
     assert.strictEqual(r.status, "ok");
     assert.strictEqual(installCalls, 1);
     assert.strictEqual(uninstallCalls, 0);
   });
 
-  it("autoStartWithClaude effect calls uninstallAutoStart on false", () => {
+  it("autoStartWithClaude effect calls uninstallAutoStart on false", async () => {
     let installCalls = 0;
     let uninstallCalls = 0;
     const deps = {
       installAutoStart: () => installCalls++,
       uninstallAutoStart: () => uninstallCalls++,
     };
-    const r = updateRegistry.autoStartWithClaude.effect(false, deps);
+    const r = await updateRegistry.autoStartWithClaude.effect(false, deps);
     assert.strictEqual(r.status, "ok");
     assert.strictEqual(installCalls, 0);
     assert.strictEqual(uninstallCalls, 1);
@@ -679,34 +742,90 @@ describe("bubble policy commands", () => {
   });
 });
 
-describe("setAutoApproveAll danger gate", () => {
-  it("refuses to enable without confirmed:true (dialog is a real boundary)", async () => {
-    const r = await commandRegistry.setAutoApproveAll({ enabled: true }, {});
+describe("setPermissionAutomationMode danger gate", () => {
+  it("refuses auto-tools without confirmed:true (dialog is a real boundary)", async () => {
+    const r = await commandRegistry.setPermissionAutomationMode({ mode: "auto-tools" }, {});
     assert.strictEqual(r.status, "error");
-    assert.match(r.message, /confirmed:true/);
+    assert.match(r.message, /current or remembered confirmation/);
   });
 
-  it("refuses to enable when confirmed is falsy", async () => {
+  it("refuses either automatic mode when confirmed is falsy", async () => {
     for (const bad of [false, "true", 1, null, undefined]) {
-      const r = await commandRegistry.setAutoApproveAll({ enabled: true, confirmed: bad }, {});
-      assert.strictEqual(r.status, "error", `confirmed=${JSON.stringify(bad)} must be rejected`);
+      for (const mode of ["auto-tools", "unattended"]) {
+        const r = await commandRegistry.setPermissionAutomationMode({ mode, confirmed: bad }, {});
+        assert.strictEqual(r.status, "error", `${mode} confirmed=${JSON.stringify(bad)} must be rejected`);
+      }
     }
   });
 
-  it("enables only with explicit confirmed:true", async () => {
-    const r = await commandRegistry.setAutoApproveAll({ enabled: true, confirmed: true }, {});
-    assert.strictEqual(r.status, "ok");
-    assert.deepStrictEqual(r.commit, { autoApproveAllPermissions: true });
+  it("enables both automatic modes only with explicit confirmed:true", async () => {
+    for (const mode of ["auto-tools", "unattended"]) {
+      const r = await commandRegistry.setPermissionAutomationMode({ mode, confirmed: true }, {});
+      assert.strictEqual(r.status, "ok");
+      assert.deepStrictEqual(r.commit, { permissionAutomationMode: mode });
+    }
   });
 
-  it("disables immediately with no confirmation required", async () => {
-    const r = await commandRegistry.setAutoApproveAll({ enabled: false }, {});
-    assert.strictEqual(r.status, "ok");
-    assert.deepStrictEqual(r.commit, { autoApproveAllPermissions: false });
+  it("accepts a remembered confirmation for only its matching mode", async () => {
+    const autoTools = await commandRegistry.setPermissionAutomationMode(
+      { mode: "auto-tools", confirmed: false },
+      { snapshot: { permissionAutomationAutoToolsWarningDismissed: true } }
+    );
+    assert.deepStrictEqual(autoTools.commit, { permissionAutomationMode: "auto-tools" });
+
+    const unattended = await commandRegistry.setPermissionAutomationMode(
+      { mode: "unattended", confirmed: false },
+      { snapshot: { permissionAutomationAutoToolsWarningDismissed: true } }
+    );
+    assert.strictEqual(unattended.status, "error");
   });
 
-  it("rejects a non-boolean enabled", async () => {
-    const r = await commandRegistry.setAutoApproveAll({ enabled: "yes", confirmed: true }, {});
+  it("persists don't-show-again atomically only with a current confirmation", async () => {
+    const r = await commandRegistry.setPermissionAutomationMode({
+      mode: "auto-tools",
+      confirmed: true,
+      suppressFutureConfirmation: true,
+    }, {});
+    assert.deepStrictEqual(r.commit, {
+      permissionAutomationMode: "auto-tools",
+      permissionAutomationAutoToolsWarningDismissed: true,
+    });
+
+    const rejected = await commandRegistry.setPermissionAutomationMode({
+      mode: "auto-tools",
+      confirmed: false,
+      suppressFutureConfirmation: true,
+    }, { snapshot: { permissionAutomationAutoToolsWarningDismissed: true } });
+    assert.strictEqual(rejected.status, "error");
+    assert.match(rejected.message, /requires confirmed:true/);
+  });
+
+  it("rejects malformed or off-mode warning suppression", async () => {
+    assert.strictEqual(
+      (await commandRegistry.setPermissionAutomationMode({
+        mode: "auto-tools",
+        confirmed: true,
+        suppressFutureConfirmation: "yes",
+      }, {})).status,
+      "error"
+    );
+    assert.strictEqual(
+      (await commandRegistry.setPermissionAutomationMode({
+        mode: "off",
+        suppressFutureConfirmation: true,
+      }, {})).status,
+      "error"
+    );
+  });
+
+  it("switches off immediately with no confirmation required", async () => {
+    const r = await commandRegistry.setPermissionAutomationMode({ mode: "off" }, {});
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit, { permissionAutomationMode: "off" });
+  });
+
+  it("rejects an unknown mode", async () => {
+    const r = await commandRegistry.setPermissionAutomationMode({ mode: "yolo", confirmed: true }, {});
     assert.strictEqual(r.status, "error");
   });
 });
@@ -938,6 +1057,7 @@ describe("hook commands", () => {
       stopMonitorForAgent: (agentId) => calls.push(["stopMonitor", agentId]),
       clearSessionsByAgent: (agentId) => calls.push(["clearSessions", agentId]),
       dismissPermissionsByAgent: (agentId) => calls.push(["dismissPermissions", agentId]),
+      writeCodexAutoStartGate: () => true,
       cleanupIntegrations: (options) => {
         calls.push(["cleanup", options.source]);
         return {
@@ -1577,6 +1697,33 @@ describe("removeTheme command", () => {
     assert.deepStrictEqual(r.commit.themeVariant, {});
   });
 
+  // #509: removeTheme also strips the idleVisual entry
+  it("strips idleVisual entry on success when one exists", async () => {
+    const snapshotWithIdleVisual = {
+      ...baseSnapshot,
+      idleVisual: { cat: "cat-idle-nap.svg", clawd: "clawd-idle-reading.svg" },
+    };
+    const { deps } = makeDeps({ snapshot: snapshotWithIdleVisual });
+    const r = await commandRegistry.removeTheme("cat", deps);
+    assert.strictEqual(r.status, "ok");
+    assert.ok(r.commit, "commit field expected");
+    assert.deepStrictEqual(r.commit.idleVisual, { clawd: "clawd-idle-reading.svg" });
+  });
+
+  it("strips pet tint and accessory entries on success when they exist", async () => {
+    const snapshotWithCustomization = {
+      ...baseSnapshot,
+      petTint: { cat: "matcha", clawd: "gold" },
+      petAccessory: { cat: "halo", clawd: "wizard-hat" },
+    };
+    const { deps } = makeDeps({ snapshot: snapshotWithCustomization });
+    const r = await commandRegistry.removeTheme("cat", deps);
+    assert.strictEqual(r.status, "ok");
+    assert.ok(r.commit, "commit field expected");
+    assert.deepStrictEqual(r.commit.petTint, { clawd: "gold" });
+    assert.deepStrictEqual(r.commit.petAccessory, { clawd: "wizard-hat" });
+  });
+
   it("surfaces removeThemeDir throws as error status", async () => {
     const { deps } = makeDeps({
       removeThemeDir: async () => { throw new Error("EBUSY"); },
@@ -1607,6 +1754,10 @@ describe("setThemeSelection command", () => {
         const resolved = variantId === "dead" ? "default" : variantId;
         return { themeId, variantId: resolved };
       },
+      getActiveTheme: () => ({
+        _id: calls.activateTheme.at(-1)?.themeId || "clawd",
+        _capabilities: { petTint: true, accessories: true },
+      }),
       ...overrides,
     };
     return { deps, calls };
@@ -1675,6 +1826,24 @@ describe("setThemeSelection command", () => {
     assert.ok(r.commit, "commit field expected");
     assert.strictEqual(r.commit.theme, "clawd");
     assert.deepStrictEqual(r.commit.themeVariant, { clawd: "chill" });
+    assert.deepStrictEqual(r.customizationCapabilities, {
+      petTint: true,
+      accessories: true,
+    });
+  });
+
+  it("returns the activated theme's fail-closed customization capabilities", () => {
+    const { deps } = makeDeps({
+      getActiveTheme: () => ({
+        _id: "clawd",
+        _capabilities: { petTint: true, accessories: false },
+      }),
+    });
+    const r = commandRegistry.setThemeSelection({ themeId: "clawd" }, deps);
+    assert.deepStrictEqual(r.customizationCapabilities, {
+      petTint: true,
+      accessories: false,
+    });
   });
 
   it("preserves other themes' variantIds when committing", () => {
@@ -1711,6 +1880,118 @@ describe("setThemeSelection command", () => {
     const r = commandRegistry.setThemeSelection({ themeId: "clawd" }, { snapshot: baseSnapshot });
     assert.strictEqual(r.status, "error");
     assert.match(r.message, /activateTheme/);
+  });
+});
+
+// #509: default idle visual picker command.
+describe("setIdleVisual command", () => {
+  const activeTheme = {
+    _id: "clawd",
+    states: { idle: ["clawd-idle-follow.svg"] },
+    idleAnimations: [
+      { file: "clawd-idle-look.svg", duration: 6500 },
+      { file: "clawd-idle-reading.svg", duration: 14000 },
+    ],
+  };
+
+  function makeDeps(overrides = {}) {
+    return {
+      snapshot: { ...prefs.getDefaults(), idleVisual: {} },
+      getActiveTheme: () => activeTheme,
+      ...overrides,
+    };
+  }
+
+  it("rejects missing themeId and malformed file", () => {
+    assert.strictEqual(commandRegistry.setIdleVisual({}, makeDeps()).status, "error");
+    assert.strictEqual(
+      commandRegistry.setIdleVisual({ themeId: "clawd", file: 42 }, makeDeps()).status,
+      "error"
+    );
+    assert.strictEqual(
+      commandRegistry.setIdleVisual({ themeId: "clawd", file: "" }, makeDeps()).status,
+      "error"
+    );
+  });
+
+  it("errors when getActiveTheme dep is missing", () => {
+    const r = commandRegistry.setIdleVisual(
+      { themeId: "clawd", file: "clawd-idle-look.svg" },
+      { snapshot: prefs.getDefaults() }
+    );
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /getActiveTheme/);
+  });
+
+  it("rejects a themeId that is not the active theme", () => {
+    const r = commandRegistry.setIdleVisual({ themeId: "calico", file: "x.svg" }, makeDeps());
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /not the active theme/);
+  });
+
+  it("rejects files that are not idle visuals of the theme", () => {
+    const r = commandRegistry.setIdleVisual(
+      { themeId: "clawd", file: "clawd-working-typing.svg" },
+      makeDeps()
+    );
+    assert.strictEqual(r.status, "error");
+    assert.match(r.message, /not an idle visual/);
+  });
+
+  it("commits the merged map for a valid pool file, preserving other themes", () => {
+    const deps = makeDeps({
+      snapshot: { ...prefs.getDefaults(), idleVisual: { calico: "calico-idle-stretch.svg" } },
+    });
+    const r = commandRegistry.setIdleVisual({ themeId: "clawd", file: "clawd-idle-reading.svg" }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.idleVisual, {
+      calico: "calico-idle-stretch.svg",
+      clawd: "clawd-idle-reading.svg",
+    });
+  });
+
+  it("null file deletes the entry; noop when already unset", () => {
+    const deps = makeDeps({
+      snapshot: { ...prefs.getDefaults(), idleVisual: { clawd: "clawd-idle-look.svg" } },
+    });
+    const r = commandRegistry.setIdleVisual({ themeId: "clawd", file: null }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.idleVisual, {});
+
+    const r2 = commandRegistry.setIdleVisual({ themeId: "clawd", file: null }, makeDeps());
+    assert.strictEqual(r2.status, "ok");
+    assert.strictEqual(r2.noop, true);
+    assert.strictEqual(r2.commit, undefined);
+  });
+
+  it("selecting the theme default stores nothing (absence = default)", () => {
+    const deps = makeDeps({
+      snapshot: { ...prefs.getDefaults(), idleVisual: { clawd: "clawd-idle-look.svg" } },
+    });
+    const r = commandRegistry.setIdleVisual({ themeId: "clawd", file: "clawd-idle-follow.svg" }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(r.commit.idleVisual, {});
+
+    const r2 = commandRegistry.setIdleVisual(
+      { themeId: "clawd", file: "clawd-idle-follow.svg" },
+      makeDeps()
+    );
+    assert.strictEqual(r2.status, "ok");
+    assert.strictEqual(r2.noop, true);
+  });
+
+  it("noop when re-selecting the current choice", () => {
+    const deps = makeDeps({
+      snapshot: { ...prefs.getDefaults(), idleVisual: { clawd: "clawd-idle-look.svg" } },
+    });
+    const r = commandRegistry.setIdleVisual({ themeId: "clawd", file: "clawd-idle-look.svg" }, deps);
+    assert.strictEqual(r.status, "ok");
+    assert.strictEqual(r.noop, true);
+  });
+
+  it("updateRegistry accepts idleVisual plain objects only", () => {
+    assert.strictEqual(updateRegistry.idleVisual({ clawd: "x.svg" }).status, "ok");
+    assert.strictEqual(updateRegistry.idleVisual("nope").status, "error");
   });
 });
 

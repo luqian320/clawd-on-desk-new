@@ -1,12 +1,19 @@
 "use strict";
 
+const {
+  getPetTintIdForTheme,
+  resolvePetTintPayload,
+  getPetAccessoryIdForTheme,
+  resolvePetAccessoryPayload,
+} = require("./pet-customization-catalog");
+
 const MENU_AFFECTING_KEYS = new Set([
   "lang",
   "soundMuted",
   "bubbleFollowPet",
   "hideBubbles",
   "permissionBubblesEnabled",
-  "autoApproveAllPermissions",
+  "permissionAutomationMode",
   "notificationBubbleAutoCloseSeconds",
   "permissionBubbleAutoCloseSeconds",
   "updateBubbleAutoCloseSeconds",
@@ -55,11 +62,13 @@ function createSettingsEffectRouter(options = {}) {
   const sendToRenderer = options.sendToRenderer || noop;
   const sendDashboardI18n = options.sendDashboardI18n || noop;
   const sendSessionHudI18n = options.sendSessionHudI18n || noop;
+  const syncWindowTitles = options.syncWindowTitles || noop;
   const emitSessionSnapshot = options.emitSessionSnapshot || noop;
   const cleanStaleSessions = options.cleanStaleSessions || noop;
   const syncPermissionShortcuts = options.syncPermissionShortcuts || noop;
   const dismissInteractivePermissionBubbles = options.dismissInteractivePermissionBubbles || noop;
   const clearCodexNotifyBubbles = options.clearCodexNotifyBubbles || noop;
+  const clearCodexUserInputBubbles = options.clearCodexUserInputBubbles || noop;
   const clearKimiNotifyBubbles = options.clearKimiNotifyBubbles || noop;
   const refreshPassiveNotifyAutoClose = options.refreshPassiveNotifyAutoClose || noop;
   const refreshPermissionAutoCloseForPolicy = options.refreshPermissionAutoCloseForPolicy || noop;
@@ -72,6 +81,8 @@ function createSettingsEffectRouter(options = {}) {
   const reclampPetAfterEdgePinningChange = options.reclampPetAfterEdgePinningChange || noop;
   const exitMiniMode = options.exitMiniMode || noop;
   const getMiniMode = options.getMiniMode || (() => false);
+  const getActiveTheme = options.getActiveTheme || (() => null);
+  const refreshIdleVisual = options.refreshIdleVisual || noop;
   const rebuildAllMenus = options.rebuildAllMenus || noop;
   const reconcilePowerSaveBlocker = options.reconcilePowerSaveBlocker || noop;
 
@@ -98,6 +109,31 @@ function createSettingsEffectRouter(options = {}) {
     }
     if ("lowPowerIdleMode" in changes) {
       sendToRenderer("low-power-idle-mode-change", changes.lowPowerIdleMode);
+      // If the HUD/ring were already hidden when low-power mode was enabled,
+      // no visibility transition would otherwise schedule their delayed
+      // destruction. Re-sync after mirrors update so hidden windows are
+      // reclaimed under the new policy.
+      safeCall(
+        logWarn,
+        "Clawd: low-power Session HUD sync failed:",
+        syncSessionHudVisibility
+      );
+    }
+    if ("petTint" in changes) {
+      const activeTheme = getActiveTheme();
+      const tintId = getPetTintIdForTheme(changes.petTint, activeTheme && activeTheme._id);
+      sendToRenderer("pet-tint-change", resolvePetTintPayload(tintId, activeTheme));
+    }
+    if ("petAccessory" in changes) {
+      const activeTheme = getActiveTheme();
+      const accessoryId = getPetAccessoryIdForTheme(
+        changes.petAccessory,
+        activeTheme && activeTheme._id
+      );
+      sendToRenderer(
+        "pet-accessory-change",
+        resolvePetAccessoryPayload(accessoryId, activeTheme)
+      );
     }
     if ("keepAwakeWhileWorking" in changes) {
       safeCall(logWarn, "Clawd: reconcilePowerSaveBlocker failed:", reconcilePowerSaveBlocker);
@@ -105,11 +141,20 @@ function createSettingsEffectRouter(options = {}) {
     if ("lang" in changes) {
       safeCall(logWarn, "Clawd: dashboard lang broadcast failed:", sendDashboardI18n);
       safeCall(logWarn, "Clawd: session HUD lang broadcast failed:", sendSessionHudI18n);
+      safeCall(logWarn, "Clawd: window title sync failed:", syncWindowTitles);
     }
     if ("sessionAliases" in changes) {
       safeCall(
         logWarn,
         "Clawd: session alias snapshot broadcast failed:",
+        emitSessionSnapshot,
+        { force: true }
+      );
+    }
+    if ("permissionAutomationMode" in changes) {
+      safeCall(
+        logWarn,
+        "Clawd: session automation effective-mode snapshot refresh failed:",
         emitSessionSnapshot,
         { force: true }
       );
@@ -135,6 +180,7 @@ function createSettingsEffectRouter(options = {}) {
     ) {
       try {
         clearCodexNotifyBubbles(undefined, "settings-policy-disabled");
+        clearCodexUserInputBubbles(undefined, undefined, "settings-policy-disabled");
         clearKimiNotifyBubbles(undefined, "settings-policy-disabled");
       } catch (err) {
         warn(logWarn, "Clawd: clear notification bubbles failed:", err);
@@ -198,12 +244,22 @@ function createSettingsEffectRouter(options = {}) {
       || "sessionHudShowStateLabels" in changes
       || "sessionHudShowElapsed" in changes
       || "sessionHudShowContextUsage" in changes
+      || "sessionHudShowQuota" in changes
     ) {
       try {
         syncSessionHudVisibility();
         repositionFloatingBubbles();
       } catch (err) {
         warn(logWarn, "Clawd: session HUD setting sync failed:", err);
+      }
+    }
+    if ("quotaMergeSources" in changes) {
+      try {
+        // Snapshot CONTENT changes (merged vs per-source accountQuota), so a
+        // forced re-emit is needed for the Dashboard/HUD to pick it up.
+        emitSessionSnapshot({ force: true });
+      } catch (err) {
+        warn(logWarn, "Clawd: quota merge mode re-emit failed:", err);
       }
     }
     if ("sessionHudCleanupDetached" in changes && changes.sessionHudCleanupDetached === true) {
@@ -242,6 +298,9 @@ function createSettingsEffectRouter(options = {}) {
     }
     if ("disableMiniMode" in changes && changes.disableMiniMode && getMiniMode()) {
       safeCall(logWarn, "Clawd: disableMiniMode exit failed:", exitMiniMode);
+    }
+    if ("idleVisual" in changes) {
+      safeCall(logWarn, "Clawd: idle visual refresh failed:", refreshIdleVisual);
     }
 
     // 3. Menu rebuild: only for menu-affecting keys to avoid thrashing on

@@ -55,11 +55,16 @@ function createHarness(overrides = {}) {
     getCurrentState: () => state.currentState,
     getCurrentSvg: () => state.currentSvg,
     sendToRenderer: (...args) => calls.push(["sendToRenderer", ...args]),
+    recoverVisiblePetAfterRendererLoad: (event) => calls.push(["recoverVisiblePetAfterRendererLoad", event.sender]),
     setDragLocked: (value) => calls.push(["setDragLocked", value]),
     setMouseOverPet: (value) => calls.push(["setMouseOverPet", value]),
+    cancelRoam: Object.prototype.hasOwnProperty.call(overrides, "cancelRoam")
+      ? overrides.cancelRoam
+      : (() => calls.push(["cancelRoam"])),
     beginDragSnapshot: () => calls.push(["beginDragSnapshot"]),
     clearDragSnapshot: () => calls.push(["clearDragSnapshot"]),
     syncHitWin: () => calls.push(["syncHitWin"]),
+    syncImeEditingPetDodge: () => calls.push(["syncImeEditingPetDodge"]),
     isMiniMode: () => state.miniMode,
     checkMiniModeSnap: overrides.checkMiniModeSnap
       ? () => overrides.checkMiniModeSnap({ calls, state })
@@ -129,6 +134,7 @@ test("pet interaction IPC registers owned channels and disposes them", () => {
     "pause-cursor-polling",
     "pet-drop-paths",
     "pet-interaction:reveal-session-hud",
+    "pet-visual-ready",
     "play-click-reaction",
     "resume-from-reaction",
     "show-context-menu",
@@ -138,6 +144,16 @@ test("pet interaction IPC registers owned channels and disposes them", () => {
   runtime.dispose();
 
   assert.strictEqual(ipcMain.listeners.size, 0);
+});
+
+test("pet interaction IPC delegates the first rendered visual recovery signal", () => {
+  const { ipcMain, calls } = createHarness();
+
+  ipcMain.send("pet-visual-ready");
+
+  assert.deepStrictEqual(calls.filter((c) => c[0] === "recoverVisiblePetAfterRendererLoad"), [
+    ["recoverVisiblePetAfterRendererLoad", "sender-web-contents"],
+  ]);
 });
 
 test("pet interaction IPC delegates pet-interaction:reveal-session-hud to revealSessionHud", () => {
@@ -201,11 +217,22 @@ test("pet interaction IPC preserves drag lock lifecycle", () => {
   assert.deepStrictEqual(calls, [
     ["setDragLocked", true],
     ["setMouseOverPet", true],
+    ["cancelRoam"],
     ["beginDragSnapshot"],
     ["setDragLocked", false],
     ["clearDragSnapshot"],
     ["syncHitWin"],
+    // #640: the dodge defers its hit-window click-through write while a drag
+    // is in flight — releasing the lock must re-run the sync.
+    ["syncImeEditingPetDodge"],
   ]);
+});
+
+test("pet interaction IPC requires the roam cancel dependency", () => {
+  assert.throws(
+    () => createHarness({ cancelRoam: null }),
+    /registerPetInteractionIpc requires cancelRoam/,
+  );
 });
 
 test("pet interaction IPC finalizes drag end and always clears drag state", () => {
@@ -226,6 +253,7 @@ test("pet interaction IPC finalizes drag end and always clears drag state", () =
     ["repositionFloatingBubbles"],
     ["setDragLocked", false],
     ["clearDragSnapshot"],
+    ["syncImeEditingPetDodge"],
     ["checkMiniModeSnap"],
     ["computeDragEndBounds", state.petWindowBounds, state.effectivePixelSize],
     ["applyPetWindowBounds", state.clampedBounds],
@@ -236,6 +264,7 @@ test("pet interaction IPC finalizes drag end and always clears drag state", () =
     ["repositionFloatingBubbles"],
     ["setDragLocked", false],
     ["clearDragSnapshot"],
+    ["syncImeEditingPetDodge"],
   ]);
 });
 
@@ -253,6 +282,7 @@ test("pet interaction IPC skips drag-end clamp when mini snap starts", () => {
     ["checkMiniModeSnap"],
     ["setDragLocked", false],
     ["clearDragSnapshot"],
+    ["syncImeEditingPetDodge"],
   ]);
 });
 
@@ -272,6 +302,7 @@ test("pet interaction IPC does not persist when drag-end has no clamped bounds",
     ["repositionFloatingBubbles"],
     ["setDragLocked", false],
     ["clearDragSnapshot"],
+    ["syncImeEditingPetDodge"],
   ]);
 });
 
@@ -292,6 +323,7 @@ test("pet interaction IPC disables mini snap without skipping drag-end cleanup",
     ["repositionFloatingBubbles"],
     ["setDragLocked", false],
     ["clearDragSnapshot"],
+    ["syncImeEditingPetDodge"],
   ]);
 });
 
@@ -306,6 +338,7 @@ test("pet interaction IPC still clears drag state when drag end has no live pet 
     ["checkMiniModeSnap"],
     ["setDragLocked", false],
     ["clearDragSnapshot"],
+    ["syncImeEditingPetDodge"],
   ]);
 });
 

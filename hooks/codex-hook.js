@@ -5,14 +5,19 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process");
 const { StringDecoder } = require("string_decoder");
 const {
   postPermissionToRunningServer,
   postStateToRunningServer,
+  readCodexAutoStartGate,
   readHostPrefix,
+  readRuntimeIdentity,
+  CODEX_WSL_INTEROP_ARG,
+  resolveWslDistro,
   applyWslSourceFields,
 } = require("./server-config");
-const { createPidResolver, readStdinJson, getPlatformConfig } = require("./shared-process");
+const { createPidResolver, readStdinJson, getPlatformConfig, applyOrcaPaneKey } = require("./shared-process");
 const {
   ROLE_UNKNOWN,
   classifyHookPayload,
@@ -22,6 +27,7 @@ const {
   extractLastAssistantTextFromTranscript,
 } = require("./codex-assistant-output");
 const { readCodexThreadName } = require("./codex-session-index");
+const { isCodexDesktopOriginator } = require("./codex-originator");
 const { fitStateBodyToByteBudget } = require("./state-payload-size");
 
 const TOOL_MATCH_STRING_MAX = 240;
@@ -29,6 +35,7 @@ const TOOL_MATCH_ARRAY_MAX = 16;
 const TOOL_MATCH_OBJECT_KEYS_MAX = 32;
 const TOOL_MATCH_DEPTH_MAX = 6;
 const CODEX_PERMISSION_TIMEOUT_MS = 590000;
+const CODEX_AUTO_START_TIMEOUT_MS = 10000;
 const SESSION_META_READ_CHUNK_BYTES = 8192;
 const SESSION_META_READ_MAX_BYTES = 256 * 1024;
 
@@ -190,7 +197,7 @@ function applyCodexSessionMetaFields(body, payload, sessionMeta) {
 function isCodexDesktopSession(payload, sessionMeta) {
   const source = payload && typeof payload === "object" ? payload : {};
   const meta = sessionMeta && typeof sessionMeta === "object" ? sessionMeta : {};
-  return firstString(meta.originator, source.originator).toLowerCase() === "codex desktop";
+  return isCodexDesktopOriginator(firstString(meta.originator, source.originator));
 }
 
 function shouldReportForegroundWtHwnd(event) {
@@ -206,6 +213,7 @@ function applyLocalProcessFields(body, resolve, options = {}) {
   if (pidChain.length) body.pid_chain = pidChain;
   if (tmuxSocket) body.tmux_socket = tmuxSocket;
   if (tmuxClient) body.tmux_client = tmuxClient;
+  applyOrcaPaneKey(body);
   if (shouldReportForegroundWtHwnd(options.event, foregroundWtHwnd) && foregroundWtHwnd) {
     body.wt_hwnd = String(foregroundWtHwnd);
   }
@@ -273,9 +281,8 @@ function buildPermissionBody(payload, resolve) {
   const description = typeof rawToolInput.description === "string" && rawToolInput.description.trim()
     ? rawToolInput.description.trim().slice(0, 500)
     : null;
-  const toolName = typeof payload.tool_name === "string" && payload.tool_name
-    ? payload.tool_name
-    : "Unknown";
+  const toolName = typeof payload.tool_name === "string" ? payload.tool_name.trim() : "";
+  if (!toolName || /^unknown$/i.test(toolName)) return null;
   const sessionMeta = readFirstSessionMeta(payload.transcript_path);
 
   const body = {
@@ -312,6 +319,7 @@ function buildPermissionBody(payload, resolve) {
   if (process.env.CLAWD_REMOTE) {
     body.host = readHostPrefix();
     applyWslSourceFields(body, { remote: true });
+    applyOrcaPaneKey(body);
   } else {
     applyWslSourceFields(body);
     applyLocalProcessFields(body, resolve, {
@@ -380,6 +388,7 @@ function buildStateBody(payload, resolve) {
   if (process.env.CLAWD_REMOTE) {
     body.host = readHostPrefix();
     applyWslSourceFields(body, { remote: true });
+    applyOrcaPaneKey(body);
   } else {
     applyWslSourceFields(body);
     applyLocalProcessFields(body, resolve, {
@@ -391,51 +400,195 @@ function buildStateBody(payload, resolve) {
   return body;
 }
 
-function requestCodexPermission(body, callback) {
-  postPermissionToRunningServer(
+function requestCodexPermission(body, callback, options = {}) {
+  const postPermission = options.postPermission || postPermissionToRunningServer;
+  const requestOptions = {
+    timeoutMs: getCodexPermissionTimeoutMs(),
+    probeTimeoutMs: 100,
+  };
+  if (options.preferredPort) {
+    requestOptions.preferredPort = options.preferredPort;
+    requestOptions.runtimePort = options.preferredPort;
+  }
+  postPermission(
     JSON.stringify(body),
-    {
-      timeoutMs: getCodexPermissionTimeoutMs(),
-      probeTimeoutMs: 100,
-    },
-    (ok, _port, responseBody) => {
-      callback(ok ? sanitizeCodexPermissionOutput(responseBody) : buildCodexNoDecisionOutput());
+    requestOptions,
+    (ok, port, responseBody) => {
+      callback(ok ? sanitizeCodexPermissionOutput(responseBody) : buildCodexNoDecisionOutput(), ok, port);
     }
   );
 }
 
-function main() {
-  const config = getPlatformConfig();
-  const resolve = createPidResolver({
-    agentNames: { win: new Set(["codex.exe"]), mac: new Set(["codex"]), linux: new Set(["codex"]) },
-    platformConfig: config,
-  });
-
-  readStdinJson()
-    .then((payload) => {
-      const permissionBody = buildPermissionBody(payload || {}, resolve);
-      if (permissionBody) {
-        requestCodexPermission(permissionBody, (output) => {
-          process.stdout.write(`${output}\n`);
-          process.exit(0);
-        });
+function startClawdAndWait(options = {}) {
+  const spawnProcess = options.spawn || spawn;
+  const setTimeoutFn = options.setTimeout || setTimeout;
+  const clearTimeoutFn = options.clearTimeout || clearTimeout;
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.max(0, options.timeoutMs)
+    : CODEX_AUTO_START_TIMEOUT_MS;
+  return new Promise((resolveStart) => {
+    let settled = false;
+    let child = null;
+    let timer = null;
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeoutFn(timer);
+        timer = null;
+      }
+      if (child && typeof child.removeListener === "function") {
+        child.removeListener("error", done);
+        child.removeListener("exit", done);
+      }
+    };
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveStart();
+    };
+    const onTimeout = () => {
+      if (child && typeof child.kill === "function") {
+        try { child.kill(); } catch {}
+      }
+      done();
+    };
+    try {
+      child = spawnProcess(
+        process.execPath,
+        [path.join(__dirname, "auto-start.js")],
+        { stdio: "ignore", windowsHide: true }
+      );
+      if (!child || typeof child.once !== "function") {
+        done();
         return;
       }
-
-      const body = buildStateBody(payload || {}, resolve);
-      if (!body) process.exit(0);
-      // Byte-fit before POST so a long CJK assistant_last_output can't trip the
-      // server's headerless 413 (read back as posted=false). See
-      // hooks/state-payload-size.js.
-      const fitted = fitStateBodyToByteBudget(body);
-      postStateToRunningServer(JSON.stringify(fitted.body), { timeoutMs: 100 }, () => process.exit(0));
-    })
-    .catch(() => process.exit(0));
+      child.once("error", done);
+      child.once("exit", done);
+      timer = setTimeoutFn(onTimeout, timeoutMs);
+      if (timer && typeof timer.unref === "function") timer.unref();
+    } catch {
+      done();
+    }
+  });
 }
 
-if (require.main === module) main();
+async function runCodexHook(payload, options = {}) {
+  const config = getPlatformConfig();
+  const readIdentity = options.readRuntimeIdentity || readRuntimeIdentity;
+  const createAttemptResolver = (initialPreferredPort = null) => {
+    let preferredPort = initialPreferredPort;
+    const resolverOptions = {
+      agentNames: { win: new Set(["codex.exe"]), mac: new Set(["codex"]), linux: new Set(["codex"]) },
+      platformConfig: config,
+      readRuntimeIdentity() {
+        const identity = readIdentity();
+        if (!preferredPort && identity && identity.port) preferredPort = identity.port;
+        return identity;
+      },
+    };
+    const resolve = options.resolvePid || (options.createPidResolver
+      ? options.createPidResolver(resolverOptions)
+      : createPidResolver(resolverOptions));
+    return {
+      resolve,
+      getPreferredPort: () => preferredPort,
+    };
+  };
+
+  if (payload && payload.hook_event_name === "PermissionRequest") {
+    const permissionAttempt = createAttemptResolver(options.preferredPort || null);
+    const permissionBody = buildPermissionBody(payload, permissionAttempt.resolve);
+    if (!permissionBody) return { body: null, posted: false, stdout: "" };
+    return new Promise((resolveRun) => {
+      requestCodexPermission(permissionBody, (stdout, posted, port) => {
+        resolveRun({ body: permissionBody, posted: !!posted, port: port || null, stdout });
+      }, { ...options, preferredPort: permissionAttempt.getPreferredPort() });
+    });
+  }
+
+  const postState = options.postState || postStateToRunningServer;
+  const buildStateAttempt = (preferredPort = null) => {
+    const attempt = createAttemptResolver(preferredPort);
+    const body = buildStateBody(payload || {}, attempt.resolve);
+    if (!body) return null;
+    // Byte-fit before POST so a long CJK assistant_last_output can't trip the
+    // server's headerless 413 (read back as posted=false). See
+    // hooks/state-payload-size.js.
+    const fitted = fitStateBodyToByteBudget(body);
+    return { body: fitted.body, preferredPort: attempt.getPreferredPort() };
+  };
+  const postAttempt = (attempt) => new Promise((resolveRun) => {
+    const requestOptions = { timeoutMs: 100 };
+    if (attempt.preferredPort) {
+      requestOptions.preferredPort = attempt.preferredPort;
+      requestOptions.runtimePort = attempt.preferredPort;
+    }
+    postState(
+      JSON.stringify(attempt.body),
+      requestOptions,
+      (posted, port) => resolveRun({
+        body: attempt.body,
+        posted: !!posted,
+        port: port || null,
+        stdout: "",
+      })
+    );
+  });
+
+  const firstAttempt = buildStateAttempt(options.preferredPort || null);
+  if (!firstAttempt) return { body: null, posted: false, stdout: "" };
+  const result = await postAttempt(firstAttempt);
+  const env = options.env || process.env;
+  const argv = Array.isArray(options.argv) ? options.argv : process.argv;
+  const wslInterop = argv.includes(CODEX_WSL_INTEROP_ARG);
+  let wslDistro = null;
+  try {
+    const resolveHookWslDistro = options.resolveWslDistro || resolveWslDistro;
+    wslDistro = resolveHookWslDistro();
+  } catch {}
+  if (
+    result.posted
+    || payload.hook_event_name !== "SessionStart"
+    || env.CLAWD_REMOTE
+    || env.CLAWD_WSL_DISTRO
+    || wslInterop
+    || wslDistro
+  ) return result;
+
+  const readAutoStartGate = options.readCodexAutoStartGate || readCodexAutoStartGate;
+  let autoStartEnabled = false;
+  try {
+    autoStartEnabled = readAutoStartGate(options.codexAutoStartGateOptions || {}) === true;
+  } catch {}
+  if (!autoStartEnabled) return result;
+
+  // Codex launches matching hooks concurrently, so a separate SessionStart
+  // auto-start hook would race this state delivery. Wait for the existing
+  // launcher helper to finish its readiness probe, then rebuild this event
+  // with fresh runtime and process identity before retrying it.
+  const runAutoStart = options.runAutoStart || startClawdAndWait;
+  await runAutoStart();
+  let refreshedPort = null;
+  try {
+    const identity = readIdentity();
+    if (identity && identity.port) refreshedPort = identity.port;
+  } catch {}
+  const retryAttempt = buildStateAttempt(refreshedPort);
+  return postAttempt(retryAttempt);
+}
+
+async function main() {
+  const payload = await readStdinJson();
+  const result = await runCodexHook(payload || {});
+  if (result.stdout) process.stdout.write(`${result.stdout}\n`);
+}
+
+if (require.main === module) {
+  main().then(() => process.exit(0), () => process.exit(0));
+}
 
 module.exports = {
+  CODEX_AUTO_START_TIMEOUT_MS,
   EVENT_TO_STATE,
   applyCodexSessionMetaFields,
   applyLocalProcessFields,
@@ -449,6 +602,8 @@ module.exports = {
   isCodexDesktopSession,
   normalizeCodexSessionId,
   readFirstSessionMeta,
+  runCodexHook,
   sanitizeCodexPermissionDecision,
   sanitizeCodexPermissionOutput,
+  startClawdAndWait,
 };

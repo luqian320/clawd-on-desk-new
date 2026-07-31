@@ -29,6 +29,8 @@ describe("prefs.getDefaults", () => {
     assert.notStrictEqual(a, b);
     assert.notStrictEqual(a.agents, b.agents);
     assert.notStrictEqual(a.themeOverrides, b.themeOverrides);
+    assert.notStrictEqual(a.petTint, b.petTint);
+    assert.notStrictEqual(a.petAccessory, b.petAccessory);
     assert.notStrictEqual(a.shortcuts, b.shortcuts);
     assert.notStrictEqual(a.sessionAliases, b.sessionAliases);
     assert.notStrictEqual(a.tgApproval, b.tgApproval);
@@ -46,6 +48,8 @@ describe("prefs.getDefaults", () => {
     const d = prefs.getDefaults();
     assert.strictEqual(d.manageClaudeHooksAutomatically, true);
     assert.strictEqual(d.autoStartWithClaude, false);
+    assert.deepStrictEqual(d.petTint, {});
+    assert.deepStrictEqual(d.petAccessory, {});
     assert.strictEqual(d.lowPowerIdleMode, false);
     assert.strictEqual(d.allowEdgePinning, false);
     assert.strictEqual(d.disableMiniMode, false);
@@ -54,6 +58,9 @@ describe("prefs.getDefaults", () => {
     assert.strictEqual(d.sessionHudShowStateLabels, true);
     assert.strictEqual(d.sessionHudShowElapsed, false);
     assert.strictEqual(d.sessionHudShowContextUsage, true);
+    assert.strictEqual(d.sessionHudShowQuota, true);
+    assert.strictEqual(d.claudeQuotaCollectionEnabled, false);
+    assert.strictEqual(d.quotaMergeSources, false);
     assert.strictEqual(d.sessionHudCleanupDetached, true);
     assert.strictEqual("sessionHudAutoHide" in d, false);
     assert.strictEqual(d.sessionHudPinned, false);
@@ -74,6 +81,9 @@ describe("prefs.getDefaults", () => {
     });
     assert.deepStrictEqual(d.feishuApproval, {
       enabled: false,
+      // Feishu (China) is the default so existing users keep the platform they
+      // were implicitly on before this field existed.
+      platform: "feishu",
       idType: "open_id",
       approverId: "",
       connectionTimeoutSeconds: 15,
@@ -102,7 +112,7 @@ describe("prefs.getDefaults", () => {
         `${id} should default permissionsEnabled`
       );
     }
-    for (const id of ["antigravity-cli", "codewhale", "pi", "openclaw", "qoder"]) {
+    for (const id of ["antigravity-cli", "codewhale", "pi", "openclaw", "qoder", "workbuddy"]) {
       assert.strictEqual(
         d.agents[id].permissionsEnabled,
         false,
@@ -142,6 +152,16 @@ describe("prefs.getDefaults", () => {
     assert.strictEqual(d.agents.qoder.notificationHookEnabled, true);
   });
 
+  it("defaults WorkBuddy permission bubbles off (state-only, #618)", () => {
+    // The desktop app owns the permission loop in its native sandbox + GUI;
+    // Clawd only mirrors state and pops a waiting Notification.
+    const d = prefs.getDefaults();
+    assert.strictEqual(d.agents.workbuddy.integrationInstalled, false);
+    assert.strictEqual(d.agents.workbuddy.enabled, false);
+    assert.strictEqual(d.agents.workbuddy.permissionsEnabled, false);
+    assert.strictEqual(d.agents.workbuddy.notificationHookEnabled, true);
+  });
+
   it("defaults CodeWhale permission bubbles off (state-only)", () => {
     const d = prefs.getDefaults();
     assert.strictEqual(d.agents.codewhale.integrationInstalled, false);
@@ -172,6 +192,8 @@ describe("prefs.validate", () => {
       lang: "klingon",       // not in enum
       soundMuted: "yes",     // wrong type
       soundVolume: 2,        // out of range → default 1
+      petTint: "custom-css",
+      petAccessory: "wizard-hat",
       lowPowerIdleMode: "yes",
       x: NaN,                // not finite
       bubbleFollowPet: true, // ok
@@ -194,6 +216,8 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.lang, d.lang);
     assert.strictEqual(v.soundMuted, false);
     assert.strictEqual(v.soundVolume, 1);
+    assert.deepStrictEqual(v.petTint, {});
+    assert.deepStrictEqual(v.petAccessory, {});
     assert.strictEqual(v.lowPowerIdleMode, false);
     assert.strictEqual(v.x, 0);
     assert.strictEqual(v.bubbleFollowPet, true);
@@ -330,6 +354,8 @@ describe("prefs.validate", () => {
       size: "P:15",
       miniEdge: "left",
       theme: "calico",
+      petTint: { clawd: "gold", cloudling: "matcha" },
+      petAccessory: { clawd: "wizard-hat", cloudling: "halo" },
     });
     assert.strictEqual(v.lang, "ko");
     assert.strictEqual(v.soundMuted, true);
@@ -352,6 +378,8 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.size, "P:15");
     assert.strictEqual(v.miniEdge, "left");
     assert.strictEqual(v.theme, "calico");
+    assert.deepStrictEqual(v.petTint, { clawd: "gold", cloudling: "matcha" });
+    assert.deepStrictEqual(v.petAccessory, { clawd: "wizard-hat", cloudling: "halo" });
   });
 
   it("accepts soundVolume 0 (silent playback is valid)", () => {
@@ -497,6 +525,77 @@ describe("prefs.validate", () => {
     }
   });
 
+  it("keeps custom tool discovery paths outside the registered agent map", () => {
+    const direct = prefs.validate({
+      customToolDiscoveryPaths: [" C:\\Tools\\AI.exe ", "C:\\Tools\\AI.exe", "C:\\Tools\\AI"],
+    });
+    assert.deepStrictEqual(direct.customToolDiscoveryPaths, ["C:\\Tools\\AI.exe", "C:\\Tools\\AI"]);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(direct.agents, "custom"), false);
+
+    const legacy = prefs.validate({
+      agents: { custom: { customDiscoveryPaths: ["C:\\Legacy\\AI.exe"] } },
+    });
+    assert.deepStrictEqual(legacy.customToolDiscoveryPaths, ["C:\\Legacy\\AI.exe"]);
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(legacy.agents, "custom"), false);
+  });
+
+  it("normalizes custom applications and enforces state-only agent gates", () => {
+    const application = {
+      id: "custom-nova-ai-0123456789ab",
+      name: "Nova AI",
+      sourcePath: "C:\\NovaAI",
+      executablePath: "C:\\NovaAI\\NovaAI.exe",
+      processName: "NovaAI.exe",
+      category: "code",
+    };
+    const value = prefs.validate({
+      customApplications: [application, application, { id: "bad" }],
+      agents: { [application.id]: { integrationInstalled: true, enabled: false, permissionsEnabled: true } },
+    });
+    assert.deepStrictEqual(value.customApplications, [application]);
+    assert.strictEqual(value.agents[application.id].integrationInstalled, false);
+    assert.strictEqual(value.agents[application.id].enabled, false);
+    assert.strictEqual(value.agents[application.id].permissionsEnabled, false);
+    assert.strictEqual(value.agents[application.id].notificationHookEnabled, true);
+  });
+
+  it("keeps custom application records and explicit gates in lockstep", () => {
+    const application = {
+      id: "custom-nova-ai-0123456789ab",
+      name: "Nova AI",
+      sourcePath: "C:\\NovaAI",
+      executablePath: "C:\\NovaAI\\NovaAI.exe",
+      processName: "NovaAI.exe",
+      category: "code",
+    };
+    const value = prefs.validate({
+      customApplications: [application],
+      agents: {
+        "custom-stale-abcdef012345": { integrationInstalled: true, enabled: true },
+        "future-agent": { enabled: false },
+      },
+    });
+
+    assert.deepStrictEqual(value.agents[application.id], {
+      integrationInstalled: false,
+      enabled: true,
+      permissionsEnabled: false,
+      notificationHookEnabled: true,
+    });
+    assert.strictEqual(value.agents["custom-stale-abcdef012345"], undefined);
+    assert.strictEqual(value.agents["future-agent"].enabled, false);
+  });
+
+  it("caps existing discovery paths and preserves semicolons in array values", () => {
+    const paths = Array.from({ length: 70 }, (_, index) => `C:\\Tools\\AI-${index}`);
+    paths[0] = "C:\\Tools;Lab\\AI";
+    paths[1] = "c:\\tools;lab\\ai";
+    const value = prefs.validate({ customToolDiscoveryPaths: paths });
+
+    assert.strictEqual(value.customToolDiscoveryPaths.length, 64);
+    assert.strictEqual(value.customToolDiscoveryPaths[0], "C:\\Tools;Lab\\AI");
+  });
+
   it("normalizes agents: preserves valid Codex permissionMode", () => {
     const v = prefs.validate({
       agents: {
@@ -638,6 +737,37 @@ describe("prefs.validate", () => {
     assert.deepStrictEqual(v.themeVariant, {});
     const w = prefs.validate({ themeVariant: [1, 2] });
     assert.deepStrictEqual(w.themeVariant, {});
+  });
+
+  // #509: idleVisual field
+  it("idleVisual defaults to empty object (no migration needed)", () => {
+    const d = prefs.getDefaults();
+    assert.deepStrictEqual(d.idleVisual, {});
+  });
+
+  it("idleVisual keeps string/string pairs, drops malformed and path-y entries", () => {
+    const v = prefs.validate({
+      idleVisual: {
+        clawd: "clawd-idle-reading.svg",
+        calico: "calico-idle-stretch.svg",
+        bogus: 42,                          // wrong value type
+        "": "x.svg",                        // empty themeId
+        emptyVal: "",                       // empty file
+        sneaky: "../outside.svg",           // path traversal
+        sneakier: "sub\\dir.svg",           // backslash path
+      },
+    });
+    assert.deepStrictEqual(v.idleVisual, {
+      clawd: "clawd-idle-reading.svg",
+      calico: "calico-idle-stretch.svg",
+    });
+  });
+
+  it("idleVisual falls back to defaults when not an object", () => {
+    const v = prefs.validate({ idleVisual: "nope" });
+    assert.deepStrictEqual(v.idleVisual, {});
+    const w = prefs.validate({ idleVisual: ["a.svg"] });
+    assert.deepStrictEqual(w.idleVisual, {});
   });
 
   it("sessionAliases normalizes valid entries and drops malformed values", () => {
@@ -1108,7 +1238,19 @@ describe("prefs.migrate v11 → v12 (showDock default off for fresh installs)", 
   });
 });
 
-describe("prefs ephemeral fields (auto-pilot does not persist)", () => {
+describe("prefs permission automation safe startup persistence", () => {
+  it("defaults to off, preserves auto-tools, and downgrades unattended", () => {
+    assert.strictEqual(prefs.getDefaults().permissionAutomationMode, "off");
+    assert.strictEqual(
+      prefs.validate({ permissionAutomationMode: "auto-tools" }).permissionAutomationMode,
+      "auto-tools"
+    );
+    assert.strictEqual(
+      prefs.validate({ permissionAutomationMode: "unattended" }).permissionAutomationMode,
+      "auto-tools"
+    );
+  });
+
   it("validate() never restores a persisted autoApproveAllPermissions=true", () => {
     assert.strictEqual(prefs.validate({ autoApproveAllPermissions: true }).autoApproveAllPermissions, false);
   });
@@ -1121,6 +1263,24 @@ describe("prefs ephemeral fields (auto-pilot does not persist)", () => {
     assert.strictEqual(onDisk.lang, "zh", "non-ephemeral fields still persist");
   });
 
+  it("save() persists off and auto-tools as their matching startup modes", () => {
+    for (const mode of ["off", "auto-tools"]) {
+      const p = makeTempPath();
+      prefs.save(p, { ...prefs.getDefaults(), permissionAutomationMode: mode, lang: "zh" });
+      const onDisk = JSON.parse(fs.readFileSync(p, "utf8"));
+      assert.strictEqual(onDisk.permissionAutomationMode, mode);
+      assert.strictEqual(prefs.load(p).snapshot.permissionAutomationMode, mode);
+    }
+  });
+
+  it("save() persists unattended as the safe auto-tools startup mode", () => {
+    const p = makeTempPath();
+    prefs.save(p, { ...prefs.getDefaults(), permissionAutomationMode: "unattended", lang: "zh" });
+    const onDisk = JSON.parse(fs.readFileSync(p, "utf8"));
+    assert.strictEqual(onDisk.permissionAutomationMode, "auto-tools");
+    assert.strictEqual(prefs.load(p).snapshot.permissionAutomationMode, "auto-tools");
+  });
+
   it("survives a quit/relaunch as OFF even after being enabled mid-session", () => {
     const p = makeTempPath();
     // Session 1: user turned auto-pilot on, then the app persisted prefs.
@@ -1130,10 +1290,36 @@ describe("prefs ephemeral fields (auto-pilot does not persist)", () => {
     assert.strictEqual(snapshot.autoApproveAllPermissions, false, "auto-pilot must be off on relaunch");
   });
 
+  it("persists each automatic-mode warning acknowledgement independently", () => {
+    const p = makeTempPath();
+    prefs.save(p, {
+      ...prefs.getDefaults(),
+      permissionAutomationMode: "auto-tools",
+      permissionAutomationAutoToolsWarningDismissed: true,
+      permissionAutomationUnattendedWarningDismissed: false,
+    });
+    const { snapshot } = prefs.load(p);
+    assert.strictEqual(snapshot.permissionAutomationMode, "auto-tools");
+    assert.strictEqual(snapshot.permissionAutomationAutoToolsWarningDismissed, true);
+    assert.strictEqual(snapshot.permissionAutomationUnattendedWarningDismissed, false);
+  });
+
   it("load() ignores a hand-edited autoApproveAllPermissions:true in the file", () => {
     const p = makeTempPath();
     fs.writeFileSync(p, JSON.stringify({ version: prefs.CURRENT_VERSION, autoApproveAllPermissions: true }));
     const { snapshot } = prefs.load(p);
+    assert.strictEqual(snapshot.autoApproveAllPermissions, false);
+  });
+
+  it("load() safely downgrades a hand-edited unattended mode and ignores old true", () => {
+    const p = makeTempPath();
+    fs.writeFileSync(p, JSON.stringify({
+      version: prefs.CURRENT_VERSION,
+      permissionAutomationMode: "unattended",
+      autoApproveAllPermissions: true,
+    }));
+    const { snapshot } = prefs.load(p);
+    assert.strictEqual(snapshot.permissionAutomationMode, "auto-tools");
     assert.strictEqual(snapshot.autoApproveAllPermissions, false);
   });
 });
@@ -1141,8 +1327,10 @@ describe("prefs ephemeral fields (auto-pilot does not persist)", () => {
 describe("prefs.load", () => {
   it("returns defaults for missing file (ENOENT) without backup", () => {
     const p = makeTempPath();
-    const { snapshot, locked } = prefs.load(p);
+    const { snapshot, locked, fresh, recovered } = prefs.load(p);
     assert.strictEqual(locked, false);
+    assert.strictEqual(fresh, true);
+    assert.strictEqual(recovered, undefined);
     assert.deepStrictEqual(snapshot, prefs.getDefaults());
     // Should NOT have created a backup since file never existed
     assert.strictEqual(fs.existsSync(p + ".bak"), false);
@@ -1151,14 +1339,68 @@ describe("prefs.load", () => {
   it("backs up corrupt JSON and returns defaults", () => {
     const p = makeTempPath();
     fs.writeFileSync(p, "{ this is not valid json", "utf8");
-    const { snapshot, locked } = prefs.load(p);
+    const { snapshot, locked, recovered } = prefs.load(p);
     assert.strictEqual(locked, false);
+    assert.strictEqual(recovered, true);
     assert.deepStrictEqual(snapshot, prefs.getDefaults());
     assert.strictEqual(fs.existsSync(p + ".bak"), true);
     assert.strictEqual(
       fs.readFileSync(p + ".bak", "utf8"),
       "{ this is not valid json"
     );
+  });
+
+  it("marks a non-object prefs root as a recovered defaults snapshot", () => {
+    const p = makeTempPath();
+    fs.writeFileSync(p, "null", "utf8");
+    const { snapshot, locked, fresh, recovered } = prefs.load(p);
+    assert.strictEqual(locked, false);
+    assert.strictEqual(fresh, undefined);
+    assert.strictEqual(recovered, true);
+    assert.deepStrictEqual(snapshot, prefs.getDefaults());
+  });
+
+  it("marks an array prefs root as a recovered defaults snapshot", () => {
+    const p = makeTempPath();
+    fs.writeFileSync(p, "[]", "utf8");
+    const { snapshot, locked, fresh, recovered } = prefs.load(p);
+    assert.strictEqual(locked, false);
+    assert.strictEqual(fresh, undefined);
+    assert.strictEqual(recovered, true);
+    assert.deepStrictEqual(snapshot, prefs.getDefaults());
+  });
+
+  it("marks explicitly malformed Codex gate fields as non-authoritative", () => {
+    for (const raw of [
+      { version: prefs.CURRENT_VERSION, agents: [] },
+      { version: prefs.CURRENT_VERSION, agents: "broken" },
+      { version: prefs.CURRENT_VERSION, agents: { codex: null } },
+      { version: prefs.CURRENT_VERSION, agents: { codex: [] } },
+      { version: prefs.CURRENT_VERSION, agents: { codex: { enabled: "yes" } } },
+    ]) {
+      const p = makeTempPath();
+      fs.writeFileSync(p, JSON.stringify(raw), "utf8");
+      const result = prefs.load(p);
+      assert.strictEqual(result.locked, false);
+      assert.strictEqual(result.recovered, undefined);
+      assert.strictEqual(result.codexAutoStartAuthoritative, false);
+      assert.strictEqual(result.snapshot.agents.codex.enabled, true);
+    }
+  });
+
+  it("keeps missing legacy Codex gate fields authoritative", () => {
+    for (const raw of [
+      { lang: "zh" },
+      { version: prefs.CURRENT_VERSION },
+      { version: prefs.CURRENT_VERSION, agents: {} },
+      { version: prefs.CURRENT_VERSION, agents: { codex: {} } },
+    ]) {
+      const p = makeTempPath();
+      fs.writeFileSync(p, JSON.stringify(raw), "utf8");
+      const result = prefs.load(p);
+      assert.strictEqual(result.codexAutoStartAuthoritative, undefined);
+      assert.strictEqual(result.snapshot.agents.codex.enabled, true);
+    }
   });
 
   it("migrates a v0 file (no version field) on load", () => {
@@ -1235,6 +1477,55 @@ describe("prefs.save", () => {
     assert.strictEqual(snapshot.bubbleFollowPet, true);
     assert.strictEqual(snapshot.x, 42);
     assert.strictEqual(snapshot.version, prefs.CURRENT_VERSION);
+  });
+
+  it("round-trips per-theme pet tints and drops invalid entries before writing", () => {
+    const p = makeTempPath();
+    prefs.save(p, {
+      ...prefs.getDefaults(),
+      petTint: { clawd: "vaporwave", cloudling: "matcha" },
+    });
+    assert.deepStrictEqual(
+      prefs.load(p).snapshot.petTint,
+      { clawd: "vaporwave", cloudling: "matcha" }
+    );
+
+    prefs.save(p, {
+      ...prefs.getDefaults(),
+      petTint: { clawd: "custom", "../unsafe": "gold", calico: "none" },
+    });
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(p, "utf8")).petTint, {});
+  });
+
+  it("migrates the short-lived global pet tint to supported built-in themes", () => {
+    assert.deepStrictEqual(
+      prefs.validate({ petTint: "gold" }).petTint,
+      { clawd: "gold", cloudling: "gold" }
+    );
+    assert.deepStrictEqual(prefs.validate({ petTint: "none" }).petTint, {});
+  });
+
+  it("round-trips per-theme accessories and rejects the discarded global scalar shape", () => {
+    const p = makeTempPath();
+    prefs.save(p, {
+      ...prefs.getDefaults(),
+      petAccessory: { clawd: "wizard-hat", cloudling: "halo" },
+    });
+    assert.deepStrictEqual(
+      prefs.load(p).snapshot.petAccessory,
+      { clawd: "wizard-hat", cloudling: "halo" }
+    );
+
+    prefs.save(p, {
+      ...prefs.getDefaults(),
+      petAccessory: {
+        clawd: "seasonal",
+        "../unsafe": "halo",
+        calico: "none",
+      },
+    });
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(p, "utf8")).petAccessory, {});
+    assert.deepStrictEqual(prefs.validate({ petAccessory: "wizard-hat" }).petAccessory, {});
   });
 
   it("validates before writing — bad fields fall back to defaults on disk", () => {

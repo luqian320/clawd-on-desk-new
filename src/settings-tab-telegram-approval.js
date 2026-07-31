@@ -41,8 +41,95 @@
     formDirty: false,
   };
 
+  // Feishu (China) and Lark (International) are one channel, one component —
+  // only the SDK domain, the console URL and the brand word differ. The list is
+  // closed on purpose: a user can never point this at an arbitrary host,
+  // because the App Secret travels to whatever it names.
+  const FEISHU_PLATFORMS = ["feishu", "lark"];
+  const FEISHU_CONSOLE_URLS = Object.freeze({
+    feishu: "https://open.feishu.cn/app",
+    lark: "https://open.larksuite.com/app",
+  });
+
+  // Stable failure codes -> localized, brand-aware copy. The readiness() reasons
+  // (disabled / missing-secret / invalid-config / invalid-secret / not-running)
+  // used to fall through to main's raw English message, which named Feishu and
+  // so read as nonsense to a correctly configured Lark user.
+  const FEISHU_TEST_ERROR_KEYS = Object.freeze({
+    "no-button-response": "feishuApprovalTestNoResponse",
+    "not-connected": "feishuApprovalTestNotConnected",
+    "card-send-failed": "feishuApprovalTestSendFailed",
+    "disabled": "feishuApprovalErrorDisabled",
+    "missing-secret": "feishuApprovalErrorMissingSecret",
+    "invalid-config": "feishuApprovalErrorInvalidConfig",
+    "invalid-secret": "feishuApprovalErrorInvalidSecret",
+    "not-running": "feishuApprovalErrorNotRunning",
+  });
+
+  // Connection failures Clawd raises itself. Anything not listed here came from
+  // the SDK and has no key to translate to.
+  const FEISHU_CONNECTION_ERROR_KEYS = Object.freeze({
+    "connection-timeout": "feishuApprovalErrorConnectionTimeout",
+    "reconnect-timeout": "feishuApprovalErrorReconnectTimeout",
+    // The platform gateway rejected the app outright: the picker is on the
+    // wrong deployment. Raw SDK text for this reads
+    // "pullConnectConfig failed: code=1000040351, msg=Incorrect domain name",
+    // which never tells the user what to actually do.
+    "wrong-platform": "feishuApprovalErrorWrongPlatform",
+  });
+
+  // readiness() rejects a saved-but-unusable config with a stable reason while
+  // every field looks filled in. Without this the card cheerfully reports
+  // "credentials saved, flip the switch" next to a disabled test button, and the
+  // only clue is an untranslated tooltip. Returns "" when there is nothing to
+  // report so callers keep their normal copy.
+  //
+  // "disabled" is deliberately excluded: fields can be saved and perfectly valid
+  // while the switch is simply off, which is exactly what ReadyToEnable is for.
+  function feishuBlockingReasonMessage() {
+    const s = feishuView.status || {};
+    if (s.configured === true) return "";
+    if (s.reason !== "invalid-secret" && s.reason !== "invalid-config") return "";
+    return tBrand(FEISHU_TEST_ERROR_KEYS[s.reason]);
+  }
+
+  function feishuRuntimeErrorMessage() {
+    const s = feishuView.status || {};
+    const key = FEISHU_CONNECTION_ERROR_KEYS[s.errorCode];
+    if (key) {
+      return interpolate(tBrand(key), "{seconds}", String(s.connectionTimeoutSeconds || 15));
+    }
+    // Untranslated on purpose: an SDK failure string is arbitrary upstream text,
+    // and showing it beats hiding the user's only diagnostic.
+    return s.message || tBrand("feishuApprovalCardFailed");
+  }
+
   function t(key) {
     return helpers.t(key);
+  }
+
+  function feishuBrand(platform) {
+    return t(platform === "lark" ? "feishuApprovalBrandLark" : "feishuApprovalBrandFeishu");
+  }
+
+  // Brand-aware copy for the Feishu/Lark card. Strings carry a {brand} token
+  // rather than a hardcoded product name, so the same string renders correctly
+  // on either platform. split/join (not replace) because the replacement-string
+  // form of replace would reinterpret $-sequences, and it must swap EVERY
+  // occurrence. A no-op for keys without the token, so it is safe to use for
+  // the whole section.
+  function tBrand(key, platform) {
+    const brand = feishuBrand(platform === undefined ? currentFeishuConfig().platform : platform);
+    return String(t(key)).split("{brand}").join(brand);
+  }
+
+  // Guide steps additionally carry {consoleUrl}. Interpolating before
+  // escapeWithLink is safe and deliberate: the URL comes from the closed map
+  // above, and escapeWithLink's host whitelist still gates whatever lands here.
+  function feishuGuideText(key) {
+    const platform = currentFeishuConfig().platform;
+    const consoleUrl = FEISHU_CONSOLE_URLS[platform] || FEISHU_CONSOLE_URLS.feishu;
+    return tBrand(key, platform).split("{consoleUrl}").join(consoleUrl);
   }
 
   // String.prototype.replace's replacement-string argument treats $$/$&/$`/$'
@@ -75,6 +162,11 @@
     const timeout = Number(cfg && cfg.connectionTimeoutSeconds);
     return {
       enabled: !!(cfg && cfg.enabled),
+      // Configs written before the platform field existed carry no value here.
+      // They were implicitly Feishu, so that is what they must keep rendering
+      // as — and every saveFeishuConfig() spreads this object, so the field is
+      // carried along instead of being dropped on the next save.
+      platform: cfg && cfg.platform === "lark" ? "lark" : "feishu",
       idType: cfg && typeof cfg.idType === "string" ? cfg.idType : "open_id",
       approverId: cfg && typeof cfg.approverId === "string" ? cfg.approverId : "",
       connectionTimeoutSeconds: [5, 10, 15, 30, 60].includes(timeout) ? timeout : 15,
@@ -276,7 +368,11 @@
       s.configured === true ? "1" : "0",
       s.reason || "",
       s.message || "",
+      s.errorCode || "",
       s.secretsStored === true ? "1" : "0",
+      // Without this, going from "App ID only" to "App ID + App Secret" would
+      // not repaint: every other field in the key stays put.
+      s.secretsConfigured === true ? "1" : "0",
     ].join("");
   }
 
@@ -311,9 +407,9 @@
     refreshTokenInfo();
     refreshFeishuStatus();
     refreshFeishuSecretInfo();
-    // The migration card UI is gone, but the Step-3 enable switch still routes
-    // turn-on through the native migration test flow based on this snapshot —
-    // keep it loading even though no card renders.
+    // The native-only snapshot controls both the upgrade gate and the Step-3
+    // enable switch, so keep it live even while another status request is in
+    // flight.
     refreshMigrationSnapshot();
 
     const h1 = document.createElement("h1");
@@ -366,17 +462,22 @@
   }
 
   function refreshRuntimeStatus(payload) {
-    if (!payload || payload.channel !== "feishu") return false;
-    refreshFeishuStatus({ forceRender: true });
-    return true;
+    if (!payload) return false;
+    if (payload.channel === "feishu") {
+      refreshFeishuStatus({ forceRender: true });
+      return true;
+    }
+    if (payload.channel === "telegram") {
+      refreshMigrationSnapshot();
+      refreshStatus({ forceRender: true });
+      return true;
+    }
+    return false;
   }
 
   // ── Migration state plumbing (runtime, not UI) ────────────────────────────
-  // The v0.9.0 migration CARD is gone (window over, rollback no longer
-  // offered), but this block is alive: the Step-3 enable switch routes
-  // turn-on/off through migrationDispatch (USER_TEST_NATIVE / USER_DISABLE)
-  // and derives its visual state from the migration snapshot. The reducer +
-  // owner-manager in main own the actual sidecar/native runtime.
+  // v0.14 retires the legacy transport. Historical prefs route to an explicit
+  // native-verification gate; there is no legacy runtime or fallback.
   let migrationSnapshot = null;
   let migrationPending = false;
   let migrationSnapshotSeq = 0;
@@ -390,8 +491,7 @@
   function isNativeMigrationSelected() {
     const s = migrationState();
     return s === "NATIVE_ACTIVE"
-      || s === "TESTING_NATIVE"
-      || !!(migrationSnapshot && migrationSnapshot.transport === "native");
+      || s === "TESTING_NATIVE";
   }
 
   function isNativeMigrationActive() {
@@ -404,7 +504,7 @@
 
   function canStartNativeFromSwitch() {
     const s = migrationState();
-    return s === "IDLE" || s === "NEEDS_SETUP" || s === "LEGACY_ACTIVE";
+    return s === "IDLE" || s === "NEEDS_SETUP" || s === "NATIVE_MIGRATION_REQUIRED";
   }
 
   function statusIndicatesNativeApprovalActive() {
@@ -414,7 +514,11 @@
   }
 
   function effectiveTelegramApprovalEnabled(cfg) {
-    return !!(cfg && cfg.enabled) || isNativeMigrationActive() || statusIndicatesNativeApprovalActive();
+    const s = migrationState();
+    if (s === "NATIVE_MIGRATION_REQUIRED" || s === "NEEDS_SETUP") return false;
+    return isNativeMigrationActive()
+      || statusIndicatesNativeApprovalActive()
+      || (!migrationSnapshot && !!(cfg && cfg.enabled));
   }
 
   function migrationSnapshotRenderKey(snapshot) {
@@ -425,9 +529,11 @@
     return [
       snap.state || "",
       snap.transport || "",
+      snap.revision || 0,
+      snap.testOrigin || "",
       owner.nativePolling === true ? "1" : "0",
-      owner.sidecarRunning === true ? "1" : "0",
       snap.nativeVerifiedAt || "",
+      snap.lastTestResult ? JSON.stringify(snap.lastTestResult) : "",
     ].join("\x1f");
   }
 
@@ -447,26 +553,27 @@
     });
   }
 
-  function migrationDispatch(eventType, extra = {}) {
+  function migrationDispatch(eventType) {
     if (migrationPending) return;
     migrationPending = true;
-    callCommand("telegramMigration.dispatch", { type: eventType, ...extra }).then((res) => {
+    callCommand("telegramMigration.dispatch", { type: eventType }).then((res) => {
       migrationPending = false;
       if (res && res.snapshot) migrationSnapshot = res.snapshot;
       if (res && res.status !== "ok" && res.errorCode) {
         ops.showToast(interpolate(t("telegramMigrationErrorToast"), "{code}", res.errorCode), { error: true });
       }
-      // Status of the legacy sidecar may change as a side-effect (start/stop).
       refreshStatus({ forceRender: true });
+      ops.requestRender({ content: true });
     });
   }
 
   function buildTelegramChannelCard() {
     const kind = deriveCardKind();
-    // Default-collapse the card once the sidecar is actually running — the
-    // user no longer needs to see the setup steps. localStorage persists any
-    // manual expand/collapse from there.
-    const defaultCollapsed = kind === "running";
+    // Default-collapse the card once native polling is running — the user no
+    // longer needs to see the setup steps. localStorage persists any manual
+    // expand/collapse from there.
+    const migrationGate = buildTelegramMigrationGate();
+    const defaultCollapsed = migrationGate ? false : kind === "running";
 
     return helpers.buildCollapsibleGroup({
       id: "remote-approval.telegram",
@@ -475,11 +582,89 @@
       className: "remote-approval-channel-card tg-approval-channel-card",
       children: [
         buildChannelStatusRow(kind),
+        migrationGate,
         helpers.buildSection(t("telegramApprovalStep1Title"), [buildTokenRow()]),
         helpers.buildSection(t("telegramApprovalStep2Title"), [buildRecipientRow()]),
         buildStep3Section(),
-      ],
+      ].filter(Boolean),
     });
+  }
+
+  function buildTelegramMigrationGate() {
+    const stateName = migrationState();
+    const origin = migrationSnapshot && migrationSnapshot.testOrigin;
+    const required = stateName === "NATIVE_MIGRATION_REQUIRED";
+    const testingFromRequired = stateName === "TESTING_NATIVE" && origin !== "idle";
+    if (!required && !testingFromRequired) return null;
+
+    const wrap = document.createElement("div");
+    wrap.className = "tg-native-migration-gate";
+    const eyebrow = document.createElement("div");
+    eyebrow.className = "tg-native-migration-gate-eyebrow";
+    eyebrow.textContent = t("telegramNativeMigrationEyebrow");
+    const title = document.createElement("div");
+    title.className = "tg-native-migration-gate-title";
+    const needsNativeReverification = origin === "native-unverified"
+      || origin === "native-verified-repair";
+    title.textContent = t(needsNativeReverification
+      ? "telegramNativeReverifyTitle"
+      : "telegramLegacyRetiredTitle");
+    const body = document.createElement("div");
+    body.className = "tg-native-migration-gate-body";
+    body.textContent = t(needsNativeReverification
+      ? "telegramNativeReverifyBody"
+      : "telegramLegacyRetiredBody");
+    wrap.appendChild(eyebrow);
+    wrap.appendChild(title);
+    wrap.appendChild(body);
+
+    const lastResult = migrationSnapshot && migrationSnapshot.lastTestResult;
+    if (lastResult) {
+      const result = document.createElement("div");
+      result.className = "tg-native-migration-gate-result";
+      if (lastResult.outcome === "timeout") {
+        result.textContent = t("telegramNativeMigrationTimeout");
+      } else if (lastResult.outcome === "native-start-failed") {
+        result.textContent = t("telegramNativeMigrationStartFailed");
+      } else {
+        result.textContent = t("telegramNativeMigrationFailed");
+      }
+      wrap.appendChild(result);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "tg-native-migration-gate-actions";
+    const verify = document.createElement("button");
+    verify.type = "button";
+    verify.className = "soft-btn accent";
+    verify.textContent = testingFromRequired
+      ? t("telegramNativeMigrationWaiting")
+      : t("telegramNativeMigrationVerify");
+    verify.disabled = migrationPending || testingFromRequired;
+    verify.addEventListener("click", () => {
+      if (verify.disabled) return;
+      migrationDispatch("USER_TEST_NATIVE");
+    });
+    const disable = document.createElement("button");
+    disable.type = "button";
+    disable.className = "soft-btn";
+    disable.textContent = t("telegramNativeMigrationDisable");
+    disable.disabled = migrationPending;
+    disable.addEventListener("click", () => migrationDispatch("USER_DISABLE"));
+    const guide = document.createElement("button");
+    guide.type = "button";
+    guide.className = "soft-btn";
+    guide.textContent = t("telegramNativeMigrationGuide");
+    guide.addEventListener("click", () => {
+      helpers.openExternalSafe(
+        "https://github.com/rullerzhou-afk/clawd-on-desk/blob/main/docs/guides/telegram-approval.md"
+      );
+    });
+    actions.appendChild(verify);
+    actions.appendChild(disable);
+    actions.appendChild(guide);
+    wrap.appendChild(actions);
+    return wrap;
   }
 
   function buildFeishuChannelCard() {
@@ -493,9 +678,13 @@
       className: "remote-approval-channel-card feishu-approval-channel-card",
       children: [
         buildChannelStatusRow(kind, deriveFeishuCardMessage(kind)),
-        helpers.buildSection(t("feishuApprovalStep1Title"), [buildFeishuSecretsRow()]),
+        // Order matters: Feishu only saves the long-connection subscription
+        // mode while a long connection is live, so the enable switch (step 3)
+        // must come before the callback-subscription guide (step 4).
+        helpers.buildSection(t("feishuApprovalStep1Title"), [buildFeishuPlatformRow(), buildFeishuSecretsRow()]),
         helpers.buildSection(t("feishuApprovalStep2Title"), [buildFeishuApproverRow()]),
         buildFeishuStep3Section(),
+        buildFeishuStep4Section(),
       ],
     });
   }
@@ -614,23 +803,26 @@
     if (s.status === "running") return "running";
     if (s.status === "starting") return "starting";
     if (s.status === "failed") return "failed";
-    if (s.configured === true || (s.status === "ready" && s.secretsStored === true)) return "ready";
+    if (s.configured === true || (s.status === "ready" && s.secretsConfigured === true)) return "ready";
     return "incomplete";
   }
 
   function deriveFeishuCardMessage(kind) {
     const s = feishuView.status || {};
-    if (kind === "failed") return s.message || t("feishuApprovalCardFailed");
-    if (kind === "running") return t("feishuApprovalCardRunning");
-    if (kind === "starting") return t("feishuApprovalCardStarting");
+    if (kind === "failed") return feishuRuntimeErrorMessage();
+    if (kind === "running") return tBrand("feishuApprovalCardRunning");
+    if (kind === "starting") return tBrand("feishuApprovalCardStarting");
     if (kind === "ready") return t("feishuApprovalCardReadyToEnable");
-    const secretsOk = !!(feishuView.secretInfo && feishuView.secretInfo.configured) || s.secretsStored === true;
+    const secretsOk = feishuSecretsConfigured();
     const cfg = currentFeishuConfig();
     const approverOk = !!cfg.approverId;
     if (!secretsOk && !approverOk) return t("feishuApprovalCardMissingBoth");
-    if (!secretsOk) return t("feishuApprovalCardMissingSecrets");
+    if (!secretsOk) return tBrand("feishuApprovalCardMissingSecrets");
     if (!approverOk) return t("feishuApprovalCardMissingApprover");
-    return t("feishuApprovalCardReadyToEnable");
+    // Every field is filled in, but the runtime may still refuse the config —
+    // e.g. an App ID that isn't a self-built id. Say that instead of claiming
+    // it's ready to enable.
+    return feishuBlockingReasonMessage() || t("feishuApprovalCardReadyToEnable");
   }
 
   // ── Step 1: Bot Token ──
@@ -895,7 +1087,11 @@
     sw.setAttribute("role", "switch");
     sw.setAttribute("tabindex", "0");
     helpers.setSwitchVisual(sw, effectiveEnabled, { pending: view.configPending || migrationPending });
-    const canToggle = ready && !migrationPending && (effectiveEnabled || migrationSnapshot);
+    const migrationRequired = migrationState() === "NATIVE_MIGRATION_REQUIRED";
+    const canToggle = ready
+      && !migrationPending
+      && !migrationRequired
+      && (effectiveEnabled || migrationSnapshot);
     if (!canToggle) {
       sw.classList.add("disabled");
       sw.setAttribute("aria-disabled", "true");
@@ -903,14 +1099,9 @@
     } else {
       const toggle = () => {
         const turningOff = effectiveEnabled === true;
-        // Stop-the-bleed (zombie switch — see docs audit-r1a-notification-switch-2026-05-30):
-        // this toggle only writes tgApproval.enabled, but v0.9.0 native runtime
-        // (completion notifications + approval transport) is owned by the migration
-        // state machine and never reads that field. Turning the switch OFF must also
-        // dispatch USER_DISABLE, otherwise the native poller + completion pings keep
-        // running and the user thinks they switched it off when they didn't. The
-        // ON path now goes through the same native Test flow as the migration
-        // card instead of reviving the legacy sidecar flag.
+        // Runtime ownership lives in the migration controller. OFF dispatches
+        // USER_DISABLE; fresh/explicit-off users turn ON through the native
+        // verification flow. Required legacy users use the blocking gate CTA.
         if (turningOff) {
           if (cfg.enabled === true) {
             saveConfig({ ...cfg, enabled: false }, { resetDraft: false });
@@ -1035,8 +1226,9 @@
   function buildTestRow({ ready }) {
     const s = view.status || {};
     const runtimeReady = s.configured === true;
-    const nativeStatus = s.transport === "native" || isNativeMigrationSelected();
-    const nativeReady = !nativeStatus || (migrationState() === "NATIVE_ACTIVE" && s.status === "running");
+    const nativeReady = migrationState() === "NATIVE_ACTIVE"
+      && s.transport === "native"
+      && s.status === "running";
     const testDisabled = view.testPending || !ready || !runtimeReady || !nativeReady;
     const row = document.createElement("div");
     row.className = "row";
@@ -1084,6 +1276,56 @@
     return row;
   }
 
+  // ── Feishu / Lark: platform ──
+
+  // Saves immediately (like the enable switch and the timeout select) rather
+  // than joining the approver draft: the platform decides which host the
+  // credentials below are even valid against, so the guide/links must follow it
+  // right away. The write goes through settings-controller like every other
+  // field here; the runtime notices the changed signature and reconnects both
+  // the REST client and the WS long connection to the new domain.
+  function buildFeishuPlatformRow() {
+    const cfg = currentFeishuConfig();
+    const row = document.createElement("div");
+    row.className = "row feishu-approval-platform-row";
+
+    const text = document.createElement("div");
+    text.className = "row-text";
+    const label = document.createElement("span");
+    label.className = "row-label";
+    label.textContent = t("feishuApprovalPlatformLabel");
+    const desc = document.createElement("span");
+    desc.className = "row-desc";
+    desc.textContent = t("feishuApprovalPlatformDesc");
+    text.appendChild(label);
+    text.appendChild(desc);
+    row.appendChild(text);
+
+    const ctrl = document.createElement("div");
+    ctrl.className = "row-control";
+    const segmented = document.createElement("div");
+    segmented.className = "segmented feishu-approval-platform";
+    segmented.setAttribute("role", "tablist");
+    for (const platform of FEISHU_PLATFORMS) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.dataset.platform = platform;
+      // Same source of truth as the {brand} token, so the button and the copy
+      // it controls can never drift apart.
+      btn.textContent = feishuBrand(platform);
+      btn.classList.toggle("active", cfg.platform === platform);
+      btn.disabled = feishuView.configPending;
+      btn.addEventListener("click", () => {
+        if (feishuView.configPending || cfg.platform === platform) return;
+        saveFeishuConfig({ ...cfg, platform }, { resetDraft: false });
+      });
+      segmented.appendChild(btn);
+    }
+    ctrl.appendChild(segmented);
+    row.appendChild(ctrl);
+    return row;
+  }
+
   // ── Feishu: App credentials ──
 
   function buildFeishuSecretsRow() {
@@ -1110,7 +1352,7 @@
     label.appendChild(masked);
     const desc = document.createElement("span");
     desc.className = "row-desc";
-    desc.textContent = t("feishuApprovalSecretsConfiguredDesc");
+    desc.textContent = tBrand("feishuApprovalSecretsConfiguredDesc");
     text.appendChild(label);
     text.appendChild(desc);
     row.appendChild(text);
@@ -1138,12 +1380,12 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
-    label.textContent = t("feishuApprovalSecretsLabel");
+    label.textContent = tBrand("feishuApprovalSecretsLabel");
     const desc = document.createElement("span");
     desc.className = "row-desc";
     desc.innerHTML = configured
       ? escapeWithLink(t("feishuApprovalSecretsReplaceHintHtml"))
-      : escapeWithLink(t("feishuApprovalSecretsHintHtml"));
+      : escapeWithLink(tBrand("feishuApprovalSecretsHintHtml"));
     bindExternalLinks(desc);
     text.appendChild(label);
     if (configured && info) {
@@ -1179,7 +1421,7 @@
         return;
       }
       if (configured && !payload.appId && !payload.appSecret && !payload.verificationToken && !payload.encryptKey) {
-        ops.showToast(t("feishuApprovalSecretsEmpty"), { error: true });
+        ops.showToast(tBrand("feishuApprovalSecretsEmpty"), { error: true });
         return;
       }
       feishuView.secretPending = true;
@@ -1187,11 +1429,17 @@
       callCommand("feishuApproval.setSecrets", payload).then((result) => {
         feishuView.secretPending = false;
         if (!result || result.status !== "ok") {
-          ops.showToast((result && result.message) || t("feishuApprovalSecretsSaveFailed"), { error: true });
+          // Localized copy first, with the writer's English diagnostic appended
+          // as detail — it names the actual cause (EACCES, ENOSPC…), which the
+          // translated sentence deliberately does not try to guess.
+          let text = tBrand("feishuApprovalSecretsSaveFailed");
+          const detail = result && result.message ? String(result.message) : "";
+          if (detail) text += ` (${detail})`;
+          ops.showToast(text, { error: true });
           ops.requestRender({ content: true });
           return;
         }
-        ops.showToast(t("feishuApprovalSecretsSaved"));
+        ops.showToast(tBrand("feishuApprovalSecretsSaved"));
         feishuView.secretEditing = false;
         feishuView.secretInfo = null;
         feishuView.status = null;
@@ -1231,7 +1479,39 @@
     return input;
   }
 
-  // ── Feishu: approver ──
+  // ── Feishu: approver + event subscription ──
+
+  // The Feishu app must subscribe to card.action.trigger over a long
+  // connection, or button presses never reach Clawd (#493). The header states
+  // the requirement; the step-by-step guide stays collapsed by default.
+  function buildFeishuEventSubRow() {
+    const steps = [
+      "feishuApprovalEventSubStep1Html",
+      "feishuApprovalEventSubStep2",
+      "feishuApprovalEventSubStep3",
+      "feishuApprovalEventSubStep4",
+    ].map((key) => {
+      const row = document.createElement("div");
+      row.className = "row feishu-approval-event-sub-step";
+      const text = document.createElement("div");
+      text.className = "row-text";
+      const desc = document.createElement("span");
+      desc.className = "row-desc";
+      desc.innerHTML = escapeWithLink(feishuGuideText(key));
+      bindExternalLinks(desc);
+      text.appendChild(desc);
+      row.appendChild(text);
+      return row;
+    });
+    return helpers.buildCollapsibleGroup({
+      id: "remote-approval.feishu.event-sub",
+      title: t("feishuApprovalEventSubLabel"),
+      desc: tBrand("feishuApprovalEventSubDesc"),
+      defaultCollapsed: true,
+      className: "feishu-approval-event-sub-row",
+      children: steps,
+    });
+  }
 
   function buildFeishuApproverRow() {
     const draft = getFeishuFormDraft();
@@ -1242,13 +1522,22 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
-    label.textContent = t("feishuApprovalApproverLabel");
+    label.textContent = tBrand("feishuApprovalApproverLabel");
     const desc = document.createElement("span");
     desc.className = "row-desc";
-    desc.innerHTML = escapeWithLink(t("feishuApprovalApproverHintHtml"));
+    desc.innerHTML = escapeWithLink(tBrand("feishuApprovalApproverHintHtml"));
     bindExternalLinks(desc);
     text.appendChild(label);
     text.appendChild(desc);
+    // Only user_id costs an extra scope ("Get user user ID"). open_id (the
+    // default) and union_id do not, so the note must not be shown for them —
+    // over-warning pushes users to request permissions they don't need.
+    if (draft.idType === "user_id") {
+      const note = document.createElement("span");
+      note.className = "row-desc feishu-approval-id-type-note";
+      note.textContent = t("feishuApprovalIdTypeUserIdNote");
+      text.appendChild(note);
+    }
     row.appendChild(text);
 
     const ctrl = document.createElement("div");
@@ -1293,7 +1582,7 @@
       const approverId = String(nextDraft.approverId || "").trim();
       const idType = ["open_id", "user_id", "union_id"].includes(nextDraft.idType) ? nextDraft.idType : "open_id";
       if (!approverId) {
-        ops.showToast(t("feishuApprovalApproverEmpty"), { error: true });
+        ops.showToast(tBrand("feishuApprovalApproverEmpty"), { error: true });
         return;
       }
       saveFeishuConfig({
@@ -1312,21 +1601,39 @@
 
   // ── Feishu: Enable + Test ──
 
-  function buildFeishuStep3Section() {
-    const secretsConfigured = !!(feishuView.secretInfo && feishuView.secretInfo.configured)
-      || (feishuView.status && feishuView.status.secretsStored === true);
+  // "Configured" means App ID AND App Secret are both present — never
+  // status.secretsStored, which is true for ANY stored secret and would let a
+  // half-written env file (App ID only, or just a Verification Token) pass as a
+  // finished setup. Both sources below agree on the both-present meaning.
+  function feishuSecretsConfigured() {
+    const s = feishuView.status || {};
+    return !!(feishuView.secretInfo && feishuView.secretInfo.configured) || s.secretsConfigured === true;
+  }
+
+  function feishuSetupProgress() {
+    const secretsConfigured = feishuSecretsConfigured();
     const cfg = currentFeishuConfig();
     const approverConfigured = !!cfg.approverId;
-    const ready = secretsConfigured && approverConfigured;
+    return { secretsConfigured, approverConfigured, ready: secretsConfigured && approverConfigured };
+  }
 
+  function buildFeishuStep3Section() {
+    const { secretsConfigured, approverConfigured, ready } = feishuSetupProgress();
     const rows = [];
     if (!ready) {
       rows.push(buildFeishuPrerequisitesRow({ secretsConfigured, approverConfigured }));
     }
     rows.push(buildFeishuEnabledRow({ ready }));
     rows.push(buildFeishuTimeoutRow());
-    rows.push(buildFeishuTestRow({ ready }));
     return helpers.buildSection(t("feishuApprovalStep3Title"), rows);
+  }
+
+  function buildFeishuStep4Section() {
+    const { ready } = feishuSetupProgress();
+    return helpers.buildSection(t("feishuApprovalStep4Title"), [
+      buildFeishuEventSubRow(),
+      buildFeishuTestRow({ ready }),
+    ]);
   }
 
   function buildFeishuPrerequisitesRow({ secretsConfigured, approverConfigured }) {
@@ -1359,10 +1666,10 @@
     text.className = "row-text";
     const label = document.createElement("span");
     label.className = "row-label";
-    label.textContent = t("feishuApprovalToggle");
+    label.textContent = tBrand("feishuApprovalToggle");
     const desc = document.createElement("span");
     desc.className = "row-desc";
-    desc.textContent = t("feishuApprovalToggleDesc");
+    desc.textContent = tBrand("feishuApprovalToggleDesc");
     text.appendChild(label);
     text.appendChild(desc);
     row.appendChild(text);
@@ -1405,7 +1712,7 @@
     label.textContent = t("feishuApprovalConnectionTimeout");
     const desc = document.createElement("span");
     desc.className = "row-desc";
-    desc.textContent = t("feishuApprovalConnectionTimeoutDesc");
+    desc.textContent = tBrand("feishuApprovalConnectionTimeoutDesc");
     text.appendChild(label);
     text.appendChild(desc);
     row.appendChild(text);
@@ -1447,7 +1754,7 @@
     label.textContent = t("feishuApprovalTest");
     const desc = document.createElement("span");
     desc.className = "row-desc";
-    desc.textContent = t("feishuApprovalTestDesc");
+    desc.textContent = tBrand("feishuApprovalTestDesc");
     text.appendChild(label);
     text.appendChild(desc);
     row.appendChild(text);
@@ -1460,7 +1767,12 @@
     btn.textContent = feishuView.testPending ? t("feishuApprovalTesting") : t("feishuApprovalSendTest");
     btn.disabled = testDisabled;
     if (testDisabled && !feishuView.testPending) {
-      btn.title = (s.message && String(s.message)) || t("feishuApprovalCardMissingBoth");
+      // Prefer the translated reason the button is dead; the raw English
+      // s.message is the last resort, not the first choice.
+      btn.title = feishuBlockingReasonMessage()
+        || (s.status === "failed" ? feishuRuntimeErrorMessage() : "")
+        || (s.message && String(s.message))
+        || t("feishuApprovalCardMissingBoth");
     }
     btn.addEventListener("click", () => {
       if (testDisabled) return;
@@ -1469,9 +1781,15 @@
       callCommand("feishuApproval.test").then((result) => {
         feishuView.testPending = false;
         if (result && result.status === "ok") {
-          ops.showToast(t("feishuApprovalTestSent"));
+          ops.showToast(tBrand("feishuApprovalTestSent"));
         } else {
-          ops.showToast((result && result.message) || t("feishuApprovalTestFailed"), { error: true });
+          const code = result && result.code;
+          const codeKey = FEISHU_TEST_ERROR_KEYS[code] || "";
+          let text = codeKey ? tBrand(codeKey) : ((result && result.message) || tBrand("feishuApprovalTestFailed"));
+          // Surface the SDK error for send failures — it usually names the
+          // culprit directly (e.g. invalid receive_id for a bad approver id).
+          if (code === "card-send-failed" && result.message) text += ` (${result.message})`;
+          ops.showToast(text, { error: true });
         }
         feishuView.status = null;
         refreshFeishuStatus({ forceRender: true });
@@ -1523,7 +1841,7 @@
         ops.requestRender({ content: true });
         return;
       }
-      ops.showToast(t("feishuApprovalConfigSaved"));
+      ops.showToast(tBrand("feishuApprovalConfigSaved"));
       if (options.resetDraft !== false) resetFeishuFormDraft();
       feishuView.status = null;
       refreshFeishuStatus({ forceRender: true });
@@ -1546,14 +1864,22 @@
   }
 
   // i18n hint strings use a constrained mini-syntax: literal text plus
-  // [text](https://...) link tokens. We escape the literal text and only
-  // expand whitelisted https://t.me/* links so a malicious translation can't
-  // inject arbitrary HTML.
+  // [text](https://...) link tokens. We escape the literal text and only expand
+  // whitelisted https://t.me/*, https://open.feishu.cn/* and
+  // https://open.larksuite.com/* links so a malicious translation can't inject
+  // arbitrary HTML.
+  //
+  // This is a whitelist, NOT a URL parser: every dot is escaped so the host is
+  // matched literally, and the alternation must be followed immediately by "/".
+  // That combination is what rejects the near-miss hosts — `open-larksuite.com`
+  // (unescaped `.` would match the hyphen), `open.larksuite.com.evil.com` (no
+  // "/" after the host) and `evil.com@open.larksuite.com` (userinfo before the
+  // host). Do not loosen it.
   function escapeWithLink(text) {
     const raw = String(text == null ? "" : text);
     const parts = [];
     let lastIdx = 0;
-    const re = /\[([^\]]+)\]\((https:\/\/t\.me\/[A-Za-z0-9_./?#=&-]+)\)/g;
+    const re = /\[([^\]]+)\]\((https:\/\/(?:t\.me|open\.feishu\.cn|open\.larksuite\.com)\/[A-Za-z0-9_./?#=&-]+)\)/g;
     let match;
     while ((match = re.exec(raw)) !== null) {
       parts.push(escapeHtml(raw.slice(lastIdx, match.index)));

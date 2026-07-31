@@ -9,6 +9,8 @@ const vm = require("node:vm");
 const SRC_DIR = path.join(__dirname, "..", "src");
 const SETTINGS_HTML = path.join(SRC_DIR, "settings.html");
 const SETTINGS_CSS = path.join(SRC_DIR, "settings.css");
+const LANGUAGE_PICKER_JS = path.join(SRC_DIR, "language-picker.js");
+const LANGUAGE_PICKER_CSS = path.join(SRC_DIR, "language-picker.css");
 const SETTINGS_TAB_GENERAL = path.join(SRC_DIR, "settings-tab-general.js");
 const SETTINGS_RENDERER = path.join(SRC_DIR, "settings-renderer.js");
 const SETTINGS_UI_CORE = path.join(SRC_DIR, "settings-ui-core.js");
@@ -37,6 +39,13 @@ const VERIFIED_GITHUB_CONTRIBUTORS = [
   "NeroAyase",
   "divergentD",
   "Ne9roni",
+  "jiaxuan1101",
+  "kkirito16",
+  "200780381",
+  "Dxy2326",
+  "lurui1997",
+  "JesmonX",
+  "chen86860",
 ];
 
 function createDeferred() {
@@ -159,6 +168,19 @@ class FakeClassList {
   }
 }
 
+// FakeElement.textContent is a plain field, not an aggregating DOM getter, so
+// reading it on a container yields "" and any "does this text appear?" check
+// against it passes vacuously. Walk the tree instead, and include innerHTML —
+// the guide rows render through it.
+function collectText(el) {
+  if (!el) return "";
+  const parts = [];
+  if (el.textContent) parts.push(String(el.textContent));
+  if (el.innerHTML) parts.push(String(el.innerHTML));
+  for (const child of el.children || []) parts.push(collectText(child));
+  return parts.join(" ");
+}
+
 class FakeElement {
   constructor(tagName) {
     this.tagName = String(tagName || "").toUpperCase();
@@ -171,6 +193,7 @@ class FakeElement {
     this.title = "";
     this.type = "";
     this.disabled = false;
+    this.focused = false;
     this.open = false;
     this.parentNode = null;
     this.scrollTop = 0;
@@ -232,6 +255,10 @@ class FakeElement {
   addEventListener(type, cb) {
     if (!this.eventListeners[type]) this.eventListeners[type] = [];
     this.eventListeners[type].push(cb);
+  }
+
+  focus() {
+    this.focused = true;
   }
 
   dispatchEvent(event) {
@@ -349,6 +376,98 @@ class FakeElement {
   }
 }
 
+function loadSharedLanguagePickerForTest({
+  value = "en",
+  options = ["en", "zh", "ja"],
+  onChange = () => Promise.resolve(true),
+  innerHeight = 600,
+} = {}) {
+  const body = new FakeElement("body");
+  const boundary = new FakeElement("div");
+  boundary.setAttribute("data-language-picker-boundary", "");
+  body.appendChild(boundary);
+  const documentListeners = new Map();
+  const windowListeners = new Map();
+  const animationFrames = new Map();
+  let nextAnimationFrameId = 1;
+  const document = {
+    body,
+    documentElement: { clientHeight: innerHeight },
+    createElement: (tagName) => new FakeElement(tagName),
+    addEventListener(type, cb) {
+      if (!documentListeners.has(type)) documentListeners.set(type, []);
+      documentListeners.get(type).push(cb);
+    },
+    removeEventListener(type, cb) {
+      const listeners = documentListeners.get(type);
+      if (!listeners) return;
+      const index = listeners.indexOf(cb);
+      if (index !== -1) listeners.splice(index, 1);
+    },
+  };
+  const context = {
+    console,
+    document,
+    innerHeight,
+    addEventListener(type, cb) {
+      if (!windowListeners.has(type)) windowListeners.set(type, []);
+      windowListeners.get(type).push(cb);
+    },
+    removeEventListener(type, cb) {
+      const listeners = windowListeners.get(type);
+      if (!listeners) return;
+      const index = listeners.indexOf(cb);
+      if (index !== -1) listeners.splice(index, 1);
+    },
+    requestAnimationFrame(cb) {
+      const id = nextAnimationFrameId++;
+      animationFrames.set(id, cb);
+      return id;
+    },
+    cancelAnimationFrame(id) {
+      animationFrames.delete(id);
+    },
+    window: null,
+    globalThis: null,
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(LANGUAGE_PICKER_JS, "utf8"), context);
+
+  const control = context.ClawdLanguagePicker.createLanguagePicker({
+    value,
+    options: options.map((option) => ({ value: option, label: option.toUpperCase() })),
+    ariaLabel: "Language",
+    onChange,
+  });
+  boundary.appendChild(control.element);
+
+  return {
+    boundary,
+    control,
+    picker: control.element,
+    trigger: control.element.querySelector(".language-picker-trigger"),
+    menu: control.element.querySelector(".language-picker-menu"),
+    optionElements: control.element.querySelectorAll(".language-picker-option"),
+    valueElement: control.element.querySelector(".language-picker-value"),
+    dispatchWindowEvent(type, event = {}) {
+      for (const listener of [...(windowListeners.get(type) || [])]) {
+        listener({ ...event, type });
+      }
+    },
+    flushAnimationFrames() {
+      while (animationFrames.size > 0) {
+        const pending = [...animationFrames.values()];
+        animationFrames.clear();
+        for (const callback of pending) callback();
+      }
+    },
+    getPendingAnimationFrameCount: () => animationFrames.size,
+    getWindowListenerCount: (type) => (windowListeners.get(type) || []).length,
+  };
+}
+
 function loadGeneralLanguageRowForTest({
   snapshot,
   update = () => Promise.resolve({ status: "ok" }),
@@ -442,6 +561,7 @@ function loadGeneralLanguageRowForTest({
   context.window = context;
   context.globalThis = context;
   vm.createContext(context);
+  vm.runInContext(fs.readFileSync(LANGUAGE_PICKER_JS, "utf8"), context);
   vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
   vm.runInContext(fs.readFileSync(SETTINGS_UI_CORE, "utf8"), context);
   const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8")
@@ -480,6 +600,11 @@ function loadGeneralLanguageRowForTest({
     getDocumentListenerCount: (type) => {
       const listeners = documentListeners.get(type);
       return listeners ? listeners.length : 0;
+    },
+    dispatchDocumentEvent: (type, event = {}) => {
+      const listeners = documentListeners.get(type) || [];
+      const payload = { ...event, type };
+      for (const listener of [...listeners]) listener(payload);
     },
     getToastText: () => {
       const toast = toastStack.querySelector(".toast");
@@ -561,6 +686,7 @@ function loadGeneralTabForTest({
   context.window = context;
   context.globalThis = context;
   vm.createContext(context);
+  vm.runInContext(fs.readFileSync(LANGUAGE_PICKER_JS, "utf8"), context);
   vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
   vm.runInContext(fs.readFileSync(SETTINGS_UI_CORE, "utf8"), context);
   vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8"), context);
@@ -595,6 +721,9 @@ function loadGeneralTabForTest({
 function makeGeneralSnapshot(overrides = {}) {
   return {
     lang: "en",
+    theme: "clawd",
+    petTint: {},
+    petAccessory: {},
     size: 50,
     sessionHudEnabled: true,
     sessionHudShowStateLabels: true,
@@ -634,6 +763,122 @@ function createKeyboardEventForTest(key) {
   };
 }
 
+function loadRemoteSshTabForTest({
+  snapshot,
+  cleanup = () => Promise.resolve({ status: "ok", uninstalled: true }),
+  command = () => Promise.resolve({ status: "ok" }),
+  confirm = () => true,
+} = {}) {
+  const body = new FakeElement("body");
+  const content = new FakeElement("main");
+  content.id = "content";
+  body.appendChild(content);
+
+  const document = {
+    body,
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById(id) {
+      if (id === "content") return content;
+      return null;
+    },
+  };
+  const statusListeners = [];
+  const progressListeners = [];
+  const cleanupCalls = [];
+  const commandCalls = [];
+  const remoteSsh = {
+    onStatusChanged(cb) {
+      statusListeners.push(cb);
+      return () => {};
+    },
+    onProgress(cb) {
+      progressListeners.push(cb);
+      return () => {};
+    },
+    cleanup(profileId) {
+      cleanupCalls.push(profileId);
+      return cleanup(profileId);
+    },
+    connect: () => Promise.resolve({ status: "ok" }),
+    disconnect: () => Promise.resolve({ status: "ok" }),
+    authenticate: () => Promise.resolve({ status: "ok" }),
+    openTerminal: () => Promise.resolve({ status: "ok" }),
+    deploy: () => Promise.resolve({ status: "ok" }),
+  };
+  const context = {
+    console,
+    navigator: { platform: "Win32" },
+    localStorage: {
+      getItem: () => null,
+      setItem: () => {},
+    },
+    document,
+    requestAnimationFrame: (cb) => {
+      cb();
+      return 1;
+    },
+    setTimeout,
+    confirm,
+    window: null,
+    globalThis: null,
+    remoteSsh,
+    settingsAPI: {
+      command(action, payload) {
+        commandCalls.push({ action, payload });
+        return command(action, payload);
+      },
+    },
+    ClawdSettingsSizeSlider: {
+      SIZE_UI_MIN: 1,
+      SIZE_UI_MAX: 100,
+      SIZE_TICK_VALUES: [25, 50, 75, 100],
+      SIZE_SLIDER_THUMB_DIAMETER: 18,
+      prefsSizeToUi: (value) => value,
+      clampSizeUi: (value) => value,
+      sizeUiToPct: (value) => value,
+      getSizeSliderAnchorPx: () => 0,
+      createSizeSliderController: () => ({}),
+    },
+    ClawdSettingsI18n: {
+      STRINGS: loadSettingsI18nForTest(),
+      CONTRIBUTORS: [],
+      MAINTAINERS: [],
+    },
+  };
+  context.window = context;
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(SETTINGS_ANIM_OVERRIDES_MERGE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(SETTINGS_UI_CORE, "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-remote-ssh.js"), "utf8"), context);
+
+  const core = context.ClawdSettingsCore;
+  core.state.snapshot = snapshot || { lang: "en", remoteSsh: { profiles: [] } };
+  core.state.activeTab = "remote-ssh";
+  context.ClawdSettingsTabRemoteSsh.init(core);
+
+  function renderContent() {
+    core.ops.clearMountedControls();
+    content.innerHTML = "";
+    core.tabs["remote-ssh"].render(content, core);
+  }
+  core.ops.installRenderHooks({ content: renderContent });
+  renderContent();
+
+  return {
+    content,
+    cleanupCalls,
+    commandCalls,
+    renderContent,
+    emitStatus(payload) {
+      for (const listener of statusListeners) listener(payload);
+    },
+    emitProgress(payload) {
+      for (const listener of progressListeners) listener(payload);
+    },
+  };
+}
+
 function findAncestorByClass(el, className) {
   let current = el;
   while (current) {
@@ -645,6 +890,9 @@ function findAncestorByClass(el, className) {
 
 function loadThemeTabForTest({
   themes,
+  snapshot,
+  petTintOptions,
+  petAccessoryOptions,
   settingsAPI = {},
 } = {}) {
   const body = new FakeElement("body");
@@ -653,6 +901,8 @@ function loadThemeTabForTest({
   body.appendChild(content);
 
   const commands = [];
+  const updates = [];
+  let themeListState = Array.isArray(themes) ? themes : [];
   const document = {
     body,
     createElement: (tagName) => new FakeElement(tagName),
@@ -665,6 +915,27 @@ function loadThemeTabForTest({
   const api = {
     command: (name, payload) => {
       commands.push({ name, payload });
+      if (name === "setThemeSelection" && payload && typeof payload.themeId === "string") {
+        const target = themeListState.find((theme) => theme && theme.id === payload.themeId);
+        themeListState = themeListState.map((theme) => ({
+          ...theme,
+          active: theme.id === payload.themeId,
+        }));
+        return Promise.resolve({
+          status: "ok",
+          customizationCapabilities: target
+            ? {
+                petTint: target.capabilities && target.capabilities.petTint === true,
+                accessories: target.capabilities && target.capabilities.accessories === true,
+              }
+            : null,
+        });
+      }
+      return Promise.resolve({ status: "ok" });
+    },
+    listThemes: () => Promise.resolve(themeListState),
+    update: (key, value) => {
+      updates.push({ key, value });
       return Promise.resolve({ status: "ok" });
     },
     ...settingsAPI,
@@ -711,13 +982,27 @@ function loadThemeTabForTest({
   vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-theme.js"), "utf8"), context);
 
   const core = context.ClawdSettingsCore;
-  core.state.snapshot = { lang: "en" };
+  core.state.snapshot = {
+    lang: "en",
+    petTint: {},
+    petAccessory: {},
+    ...(snapshot || {}),
+  };
   core.state.activeTab = "theme";
-  core.runtime.themeList = Array.isArray(themes) ? themes : [];
+  core.runtime.themeList = themeListState;
+  core.runtime.petTintOptions = Array.isArray(petTintOptions) ? petTintOptions : [];
+  core.runtime.petAccessoryOptions = Array.isArray(petAccessoryOptions)
+    ? petAccessoryOptions
+    : [];
   context.ClawdSettingsTabTheme.init(core);
-  core.tabs.theme.render(content, core);
+  const renderContent = () => {
+    content.innerHTML = "";
+    core.tabs.theme.render(content, core);
+  };
+  core.ops.installRenderHooks({ content: renderContent });
+  renderContent();
 
-  return { content, commands };
+  return { content, commands, updates, core, renderContent };
 }
 
 function loadAgentsTabForTest({
@@ -757,6 +1042,7 @@ function loadAgentsTabForTest({
     },
     document,
     requestAnimationFrame: (cb) => raf.requestAnimationFrame(cb),
+    setTimeout,
     window: null,
     globalThis: null,
     settingsAPI: {
@@ -784,6 +1070,22 @@ function loadAgentsTabForTest({
           agentSectionConnected: "Connected",
           agentSectionRecommended: "Detected locally",
           agentSectionUnavailable: "Not detected locally",
+          agentSearchPlaceholder: "Search",
+          agentsSubtabConnected: "Connected",
+          agentsSubtabDiscover: "Discover and add",
+          rowCustomToolsDiscoveryPathsDesc: "Choose an AI installation folder.",
+          customToolManualAdd: "Choose AI installation folder",
+          customToolNotRecognized: "No launchable application found",
+          customToolDetectionMissing: "Path missing",
+          agentInstanceScanWsl: "Scan WSL",
+          agentInstanceScanWslDesc: "Rescan WSL distros",
+          customToolRescan: "Rescan",
+          customToolScanStatusIdle: "Not scanned",
+          customToolScanStatusScanning: "Scanning...",
+          customToolScanStatusComplete: "Last scanned at {time}",
+          customToolScanStatusFailed: "Scan failed",
+          customAgentWaiting: "Waiting for first state event this run",
+          customAgentLastState: "Last state: {event} at {time}",
           rowAgentIdleAlerts: "Idle alerts",
           rowAgentIdleAlertsDesc: "Idle alert desc",
           rowAgentPermissions: "Permissions",
@@ -869,6 +1171,7 @@ function loadAgentsTabForTest({
 
 function loadAnimMapTabForTest({
   snapshot,
+  settingsAPI = {},
 } = {}) {
   const body = new FakeElement("body");
   const content = new FakeElement("main");
@@ -899,6 +1202,7 @@ function loadAnimMapTabForTest({
     globalThis: null,
     settingsAPI: {
       command: () => Promise.resolve({ status: "ok" }),
+      ...settingsAPI,
     },
     ClawdSettingsSizeSlider: {
       SIZE_UI_MIN: 1,
@@ -1113,11 +1417,20 @@ function loadAnimOverridesTabForTest({
   readersOverrides = {},
   helpersOverrides = {},
 }) {
+  const documentListeners = new Map();
   const document = {
     body: new FakeElement("body"),
     createElement: (tagName) => new FakeElement(tagName),
     getElementById: (id) => (id === "modalRoot" ? modalRoot : null),
     querySelector: () => null,
+    addEventListener(type, handler) {
+      if (!documentListeners.has(type)) documentListeners.set(type, new Set());
+      documentListeners.get(type).add(handler);
+    },
+    removeEventListener(type, handler) {
+      const listeners = documentListeners.get(type);
+      if (listeners) listeners.delete(handler);
+    },
   };
   const context = {
     console,
@@ -1147,7 +1460,7 @@ function loadAnimOverridesTabForTest({
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(SRC_DIR, "settings-tab-anim-overrides.js"), "utf8"), context);
   const core = {
-    state: { activeTab: "animOverrides" },
+    state: { activeTab: "animOverrides", mountedControls: {} },
     runtime,
     helpers: {
       t: (key) => key,
@@ -1188,7 +1501,32 @@ function loadAnimOverridesTabForTest({
     tabs: {},
   };
   context.ClawdSettingsTabAnimOverrides.init(core);
-  return { core, document };
+  return {
+    core,
+    document,
+    documentListenerCount: (type) => (documentListeners.get(type) || new Set()).size,
+  };
+}
+
+function createIdleVisualRuntime(selectedFile = null) {
+  const card = createAnimOverrideCard({ id: "state:idle", stateKey: "idle", triggerKind: "idle" });
+  return createAnimOverridesRuntime(card, {
+    animationOverridesData: {
+      theme: { id: "clawd", name: "Clawd" },
+      assets: [],
+      sections: [{ id: "idle", cards: [card] }],
+      cards: [card],
+      sounds: [],
+      idleDefaultVisual: {
+        themeId: "clawd",
+        selectedFile,
+        options: [
+          { file: "clawd-idle-follow.svg", isThemeDefault: true, label: "Idle Follow" },
+          { file: "clawd-idle-reading.svg", isThemeDefault: false, label: "Idle Reading" },
+        ],
+      },
+    },
+  });
 }
 
 function createAnimOverrideCard(overrides = {}) {
@@ -1290,6 +1628,17 @@ describe("settings renderer browser environment", () => {
 
     assert.ok(rendererSource.includes("globalThis.ClawdSettingsCore"));
     assert.ok(rendererSource.includes("settingsAPI.onRemoteApprovalStatusChanged"));
+    assert.ok(rendererSource.includes("settingsAPI.getPetTintOptions"));
+    assert.ok(rendererSource.includes("settingsAPI.getPetAccessoryOptions"));
+    assert.ok(fs.readFileSync(PRELOAD_SETTINGS, "utf8").includes(
+      'getPetTintOptions: () => ipcRenderer.invoke("settings:get-pet-tint-options")'
+    ));
+    assert.ok(fs.readFileSync(PRELOAD_SETTINGS, "utf8").includes(
+      'getQuotaSourceCount: () => ipcRenderer.invoke("settings:get-quota-source-count")'
+    ));
+    assert.ok(fs.readFileSync(PRELOAD_SETTINGS, "utf8").includes(
+      'getPetAccessoryOptions: () => ipcRenderer.invoke("settings:get-pet-accessory-options")'
+    ));
     assert.ok(rendererSource.includes("tab.refreshRuntimeStatus(payload)"));
     assert.ok(coreSource.includes("ClawdSettingsSizeSlider"));
     assert.ok(i18nSource.includes("globalThis"));
@@ -1315,6 +1664,90 @@ describe("settings renderer browser environment", () => {
     }
   });
 
+  it("waits for remote cleanup before deleting a profile and warns on incomplete uninstall", () => {
+    const source = fs.readFileSync(path.join(SRC_DIR, "settings-tab-remote-ssh.js"), "utf8");
+    const cleanupIndex = source.indexOf("await window.remoteSsh.cleanup(profile.id)");
+    const deleteIndex = source.indexOf('await callCommand("remoteSsh.delete", profile.id)');
+    assert.ok(cleanupIndex >= 0, "delete flow must await remote cleanup");
+    assert.ok(deleteIndex > cleanupIndex, "profile removal must happen after cleanup resolves");
+    assert.ok(source.includes('cleanup.uninstalled !== false'));
+    assert.ok(source.includes('remoteSshDeleteCleanupFailedConfirm'));
+  });
+
+  it("keeps remote profile deletion single-flight across runtime rerenders", async () => {
+    const cleanupDeferred = createDeferred();
+    let confirmCalls = 0;
+    const profile = {
+      id: "remote-1",
+      label: "Build host",
+      host: "builder.example.com",
+      remoteForwardPort: 23333,
+      lastDeployedAt: Date.now(),
+    };
+    const harness = loadRemoteSshTabForTest({
+      snapshot: { lang: "en", remoteSsh: { profiles: [profile] } },
+      cleanup: () => cleanupDeferred.promise,
+      confirm: () => {
+        confirmCalls++;
+        return true;
+      },
+    });
+
+    harness.content.querySelector(".remote-ssh-card").dispatchEvent({ type: "click" });
+    const originalDelete = harness.content.querySelector(".remote-ssh-btn-danger");
+    assert.ok(originalDelete);
+    assert.strictEqual(originalDelete.disabled, false);
+
+    originalDelete.dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(harness.cleanupCalls, [profile.id]);
+    assert.strictEqual(confirmCalls, 1);
+
+    const pendingDelete = harness.content.querySelector(".remote-ssh-btn-danger");
+    assert.notStrictEqual(pendingDelete, originalDelete, "starting cleanup rebuilds the detail view");
+    assert.strictEqual(pendingDelete.disabled, true);
+
+    harness.emitStatus({ profileId: profile.id, status: "idle" });
+    const afterStatusRerender = harness.content.querySelector(".remote-ssh-btn-danger");
+    assert.notStrictEqual(afterStatusRerender, pendingDelete);
+    assert.strictEqual(afterStatusRerender.disabled, true, "runtime status repaint preserves pending state");
+
+    // FakeElement permits dispatching a disabled button, unlike the browser.
+    // The handler guard must still prevent duplicate destructive IPC work.
+    afterStatusRerender.dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(harness.cleanupCalls, [profile.id]);
+    assert.strictEqual(confirmCalls, 1);
+
+    cleanupDeferred.resolve({ status: "ok", uninstalled: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(harness.commandCalls, [{ action: "remoteSsh.delete", payload: profile.id }]);
+    assert.strictEqual(harness.content.querySelector(".remote-ssh-detail"), null);
+  });
+
+  it("re-enables remote profile deletion when incomplete cleanup is kept for retry", async () => {
+    const confirmations = [true, false];
+    const profile = {
+      id: "remote-retry",
+      label: "Retry host",
+      host: "retry.example.com",
+      remoteForwardPort: 23334,
+      lastDeployedAt: Date.now(),
+    };
+    const harness = loadRemoteSshTabForTest({
+      snapshot: { lang: "en", remoteSsh: { profiles: [profile] } },
+      cleanup: () => Promise.resolve({ status: "ok", uninstalled: false }),
+      confirm: () => confirmations.shift(),
+    });
+
+    harness.content.querySelector(".remote-ssh-card").dispatchEvent({ type: "click" });
+    harness.content.querySelector(".remote-ssh-btn-danger").dispatchEvent({ type: "click" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepStrictEqual(harness.cleanupCalls, [profile.id]);
+    assert.deepStrictEqual(harness.commandCalls, [], "cancelled force-delete keeps the profile");
+    assert.ok(harness.content.querySelector(".remote-ssh-detail"));
+    assert.strictEqual(harness.content.querySelector(".remote-ssh-btn-danger").disabled, false);
+  });
+
   it("keeps About contributors visible and includes verified GitHub contributors", () => {
     const aboutSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-about.js"), "utf8");
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
@@ -1329,6 +1762,318 @@ describe("settings renderer browser environment", () => {
     for (const login of VERIFIED_GITHUB_CONTRIBUTORS) {
       assert.ok(i18nBundle.CONTRIBUTORS.includes(login), `About contributors should include ${login}`);
     }
+  });
+
+  it("keeps every Telegram retirement gate string in all supported languages", () => {
+    const strings = loadSettingsI18nForTest();
+    const keys = [
+      "telegramNativeMigrationEyebrow",
+      "telegramLegacyRetiredTitle",
+      "telegramLegacyRetiredBody",
+      "telegramNativeReverifyTitle",
+      "telegramNativeReverifyBody",
+      "telegramNativeMigrationVerify",
+      "telegramNativeMigrationWaiting",
+      "telegramNativeMigrationDisable",
+      "telegramNativeMigrationGuide",
+      "telegramNativeMigrationFailed",
+      "telegramNativeMigrationTimeout",
+      "telegramNativeMigrationStartFailed",
+    ];
+    assert.deepStrictEqual(SUPPORTED_LANGS, ["en", "zh", "zh-TW", "ko", "ja"]);
+    for (const lang of SUPPORTED_LANGS) {
+      for (const key of keys) {
+        assert.equal(
+          typeof strings[lang][key],
+          "string",
+          `${lang}.${key} must exist`,
+        );
+        assert.notEqual(strings[lang][key].trim(), "", `${lang}.${key} must not be empty`);
+      }
+    }
+  });
+
+  it("renders a blocking retired-legacy gate and dispatches only the verified native action", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_MIGRATION_REQUIRED",
+                transport: "legacy",
+                testOrigin: "legacy",
+                ownerSnapshot: { nativePolling: false },
+                revision: 1,
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "stopped",
+                transport: "off",
+                configured: true,
+                tokenStored: true,
+                reason: "native-migration-required",
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          if (name === "telegramMigration.dispatch") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "TESTING_NATIVE",
+                testOrigin: "legacy",
+                revision: 2,
+              },
+            });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const gate = harness.content.querySelector(".tg-native-migration-gate");
+    assert.ok(gate, "legacy users must see the blocking retirement gate");
+    assert.equal(
+      gate.querySelector(".tg-native-migration-gate-title").textContent,
+      "telegramLegacyRetiredTitle",
+    );
+    assert.equal(
+      harness.content.querySelector(".switch").getAttribute("aria-disabled"),
+      "true",
+      "the ordinary enable switch must not bypass migration verification",
+    );
+    const ordinaryTest = harness.content.querySelectorAll("button")
+      .find((button) => button.textContent === "telegramApprovalSendTest");
+    assert.equal(ordinaryTest.disabled, true, "ordinary Send test must not become a second migration entry");
+    const buttons = gate.querySelectorAll("button");
+    const verify = buttons.find((button) => button.textContent === "telegramNativeMigrationVerify");
+    assert.ok(verify);
+    assert.equal(
+      buttons.some((button) => /Later|legacy|rollback/i.test(button.textContent)),
+      false,
+      "the retired runtime must not expose Later, rollback, or enable-legacy actions",
+    );
+
+    verify.dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    const dispatch = commandCalls.find((call) =>
+      call.name === "telegramMigration.dispatch"
+      && call.payload
+      && call.payload.type === "USER_TEST_NATIVE");
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(dispatch && dispatch.payload)),
+      { type: "USER_TEST_NATIVE" },
+      "renderer must not attach timestamps, tokens, or arbitrary fields",
+    );
+  });
+
+  it("renders distinct native migration failure outcomes and hides the gate elsewhere", async () => {
+    for (const [outcome, expectedKey] of [
+      ["failed", "telegramNativeMigrationFailed"],
+      ["timeout", "telegramNativeMigrationTimeout"],
+      ["native-start-failed", "telegramNativeMigrationStartFailed"],
+    ]) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: {
+            enabled: true,
+            allowedTgUserId: "123456789",
+            targetSessionKey: "telegram:123456789",
+          },
+        },
+        settingsAPI: {
+          command: (name) => {
+            if (name === "telegramMigration.snapshot") {
+              return Promise.resolve({
+                status: "ok",
+                snapshot: {
+                  state: "NATIVE_MIGRATION_REQUIRED",
+                  transport: "legacy",
+                  testOrigin: "legacy",
+                  lastTestResult: { outcome, at: 1 },
+                  revision: 2,
+                  ownerSnapshot: { nativePolling: false },
+                },
+              });
+            }
+            if (name === "telegramApproval.status") {
+              return Promise.resolve({
+                status: "ok",
+                state: { status: "failed", transport: "off", configured: true, tokenStored: true },
+              });
+            }
+            if (name === "telegramApproval.tokenInfo") {
+              return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+            }
+            return Promise.resolve({ status: "ok" });
+          },
+        },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      harness.render();
+      assert.equal(
+        harness.content.querySelector(".tg-native-migration-gate-result").textContent,
+        expectedKey,
+      );
+    }
+
+    for (const migrationSnapshot of [
+      { state: "IDLE", transport: "off", revision: 1, ownerSnapshot: {} },
+      { state: "NATIVE_ACTIVE", transport: "native", revision: 1, ownerSnapshot: { nativePolling: true } },
+    ]) {
+      const harness = loadTelegramApprovalTabForTest({
+        settingsAPI: {
+          command: (name) => {
+            if (name === "telegramMigration.snapshot") {
+              return Promise.resolve({ status: "ok", snapshot: migrationSnapshot });
+            }
+            return Promise.resolve({ status: "ok" });
+          },
+        },
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      harness.render();
+      assert.equal(harness.content.querySelector(".tg-native-migration-gate"), null);
+    }
+  });
+
+  it("uses native re-verification copy when a previously verified setup is repaired", async () => {
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_MIGRATION_REQUIRED",
+                transport: "native",
+                testOrigin: "native-verified-repair",
+                revision: 2,
+                ownerSnapshot: { nativePolling: false },
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "stopped", transport: "native", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    assert.equal(
+      harness.content.querySelector(".tg-native-migration-gate-title").textContent,
+      "telegramNativeReverifyTitle",
+    );
+    assert.equal(
+      harness.content.querySelector(".tg-native-migration-gate-body").textContent,
+      "telegramNativeReverifyBody",
+    );
+  });
+
+  it("refreshes Telegram migration state from the scoped async revision signal", async () => {
+    const commandCalls = [];
+    let revision = 1;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_MIGRATION_REQUIRED",
+                transport: "legacy",
+                testOrigin: "legacy",
+                lastTestResult: revision > 1 ? { outcome: "timeout", at: 1 } : null,
+                revision,
+                ownerSnapshot: { nativePolling: false },
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "stopped", transport: "off", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+    const beforeSnapshots = commandCalls.filter((call) => call.name === "telegramMigration.snapshot").length;
+    revision = 2;
+
+    assert.equal(
+      harness.core.tabs["telegram-approval"].refreshRuntimeStatus({
+        channel: "telegram",
+        revision: 2,
+      }),
+      true,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.ok(
+      commandCalls.filter((call) => call.name === "telegramMigration.snapshot").length > beforeSnapshots,
+      "the scoped signal must pull a fresh secret-free snapshot",
+    );
+    assert.ok(harness.renderRequests.some((request) => request.content === true));
+    harness.render();
+    assert.equal(
+      harness.content.querySelector(".tg-native-migration-gate-result").textContent,
+      "telegramNativeMigrationTimeout",
+    );
   });
 
   it("keeps Telegram approval drafts local across toggles and rerenders", async () => {
@@ -1417,7 +2162,7 @@ describe("settings renderer browser environment", () => {
           if (name === "telegramMigration.snapshot") {
             return Promise.resolve({
               status: "ok",
-              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+              snapshot: { state: "NATIVE_ACTIVE", transport: "native", ownerSnapshot: { nativePolling: true } },
             });
           }
           if (name === "telegramApproval.status") {
@@ -1474,7 +2219,7 @@ describe("settings renderer browser environment", () => {
           if (name === "telegramMigration.snapshot") {
             return Promise.resolve({
               status: "ok",
-              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+              snapshot: { state: "NATIVE_ACTIVE", transport: "native", ownerSnapshot: { nativePolling: true } },
             });
           }
           if (name === "telegramApproval.status") {
@@ -1530,7 +2275,7 @@ describe("settings renderer browser environment", () => {
           if (name === "telegramMigration.snapshot") {
             return Promise.resolve({
               status: "ok",
-              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+              snapshot: { state: "NATIVE_ACTIVE", transport: "native", ownerSnapshot: { nativePolling: true } },
             });
           }
           if (name === "telegramApproval.status") {
@@ -1552,7 +2297,7 @@ describe("settings renderer browser environment", () => {
 
     harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
 
-    // The legacy switch still writes tgApproval.enabled = false…
+    // The native switch writes tgApproval.enabled = false…
     assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
       key: "tgApproval",
       value: {
@@ -2140,6 +2885,9 @@ describe("settings renderer browser environment", () => {
       key: "feishuApproval",
       value: {
         enabled: false,
+        // The snapshot in this test predates the platform field; the save must
+        // still carry the migrated value rather than dropping it.
+        platform: "feishu",
         idType: "open_id",
         approverId: "ou_f1a6f7f520883298be9b9fb9488c1aef",
         connectionTimeoutSeconds: 15,
@@ -2214,11 +2962,571 @@ describe("settings renderer browser environment", () => {
       key: "feishuApproval",
       value: {
         enabled: true,
+        platform: "feishu",
         idType: "open_id",
         approverId: "ou_1",
         connectionTimeoutSeconds: 30,
       },
     });
+  });
+
+  it("renders the Feishu event subscription guide and maps test failure codes to localized toasts", async () => {
+    const testResults = [
+      { status: "error", code: "no-button-response", message: "Feishu test did not receive a button response" },
+      { status: "error", code: "not-connected", message: "Feishu approval client is not running" },
+      { status: "error", code: "card-send-failed", message: "invalid receive_id" },
+    ];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        feishuApproval: {
+          enabled: true,
+          idType: "open_id",
+          approverId: "ou_1",
+          connectionTimeoutSeconds: 15,
+        },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          }
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "running", configured: true, secretsStored: true },
+            });
+          }
+          if (name === "feishuApproval.secretInfo") {
+            return Promise.resolve({ status: "ok", configured: true, appId: "cli_......abcd" });
+          }
+          if (name === "feishuApproval.test") {
+            return Promise.resolve(testResults.shift());
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const feishuCard = harness.content.querySelector(".feishu-approval-channel-card");
+    const guideRow = feishuCard.querySelector(".feishu-approval-event-sub-row");
+    assert.ok(guideRow, "Feishu event subscription guide group should render");
+    assert.equal(guideRow.querySelector(".row-label").textContent, "feishuApprovalEventSubLabel");
+    assert.equal(guideRow.querySelector(".row-desc").textContent, "feishuApprovalEventSubDesc");
+    assert.equal(guideRow.querySelectorAll(".feishu-approval-event-sub-step").length, 4);
+
+    // The subscription can only be saved after the long connection is up, so
+    // the guide must live in the same step section as the test button, after
+    // the enable switch — not before it (#493 review).
+    const testButton = feishuCard.querySelectorAll("button")
+      .find((button) => button.textContent === "feishuApprovalSendTest");
+    assert.ok(guideRow.parentNode.contains(testButton), "guide and test button share the step-4 section");
+
+    const toasts = [];
+    harness.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    assert.equal(testButton.disabled, false);
+    for (let i = 0; i < 3; i += 1) {
+      testButton.dispatchEvent({ type: "click" });
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(toasts)), [
+      { message: "feishuApprovalTestNoResponse", options: { error: true } },
+      { message: "feishuApprovalTestNotConnected", options: { error: true } },
+      { message: "feishuApprovalTestSendFailed (invalid receive_id)", options: { error: true } },
+    ]);
+  });
+
+  it("defaults the platform selector to Feishu and saves Lark through the settings controller", async () => {
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        // A pre-platform config, exactly as an upgrading Feishu user has it.
+        feishuApproval: { enabled: true, idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+    });
+    harness.render();
+
+    const buttons = harness.content.querySelector(".feishu-approval-platform").querySelectorAll("button");
+    assert.deepStrictEqual(buttons.map((b) => b.dataset.platform), ["feishu", "lark"]);
+    assert.equal(buttons[0].classList.contains("active"), true, "an old config must render as Feishu");
+    assert.equal(buttons[1].classList.contains("active"), false);
+
+    buttons[1].dispatchEvent({ type: "click" });
+    await Promise.resolve();
+
+    // Saved via settings-controller (window.settingsAPI.update), not written
+    // directly, and carrying the whole normalized config.
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates.find((call) => call.key === "feishuApproval"))), {
+      key: "feishuApproval",
+      value: {
+        enabled: true,
+        platform: "lark",
+        idType: "open_id",
+        approverId: "ou_1",
+        connectionTimeoutSeconds: 15,
+      },
+    });
+
+    // Clicking the already-active platform must not churn a save.
+    const before = harness.updates.length;
+    harness.content.querySelector(".feishu-approval-platform").querySelectorAll("button")[0]
+      .dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    assert.equal(harness.updates.length, before, "re-selecting the current platform should be a no-op");
+  });
+
+  it("keeps the Lark platform selected across re-render and shows Lark brand copy", async () => {
+    const strings = loadSettingsI18nForTest().en;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    harness.render();
+    harness.render();
+
+    const buttons = harness.content.querySelector(".feishu-approval-platform").querySelectorAll("button");
+    assert.equal(buttons[1].classList.contains("active"), true, "Lark must survive a re-render");
+
+    const text = collectText(harness.content.querySelector(".feishu-approval-channel-card"));
+    assert.ok(text.length > 0, "sanity: the card must render some text");
+    assert.ok(!text.includes("{brand}"), "no raw {brand} token may reach the user");
+    assert.ok(text.includes("Lark"), "Lark brand copy should render");
+    assert.ok(
+      !/Enable Feishu approval|Feishu app credentials|Feishu approver user id/.test(text),
+      "Feishu-branded copy must not render while Lark is selected"
+    );
+    // The channel name names both platforms so a Lark user can find it at all.
+    assert.equal(strings.feishuApprovalChannelName, "Feishu / Lark");
+    // Brand-bearing copy must not say Feishu while Lark is selected.
+    assert.equal(
+      strings.feishuApprovalToggle.split("{brand}").join("Lark"),
+      "Enable Lark approval"
+    );
+  });
+
+  it("shows the extra-permission note for user_id only", async () => {
+    const strings = loadSettingsI18nForTest().en;
+    for (const [idType, shouldShow] of [["open_id", false], ["union_id", false], ["user_id", true]]) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+          feishuApproval: { enabled: true, platform: "lark", idType, approverId: "ou_1", connectionTimeoutSeconds: 15 },
+        },
+      });
+      harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+      harness.render();
+      const note = harness.content.querySelector(".feishu-approval-id-type-note");
+      assert.equal(!!note, shouldShow, `${idType}: user-ID permission note presence`);
+      if (shouldShow) assert.match(note.textContent, /Get user user ID/);
+    }
+  });
+
+  it("reports an invalid App ID instead of claiming the setup is ready to enable", async () => {
+    // The real shape main.js produces for a saved-but-malformed App ID: every
+    // field is filled in, so the old code fell through to "ready to enable"
+    // while configured=false silently disabled the test button.
+    const strings = loadSettingsI18nForTest().en;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "stopped",
+                enabled: true,
+                platform: "lark",
+                configured: false,
+                reason: "invalid-secret",
+                message: "App ID format is invalid",
+                secretsStored: true,
+                connectionTimeoutSeconds: 15,
+              },
+            });
+          }
+          if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: true, appId: "not-......d-id" });
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const card = harness.content.querySelector(".feishu-approval-channel-card");
+    const statusText = card.querySelector(".tg-approval-channel-status-text").textContent;
+    assert.equal(
+      statusText,
+      "That App ID does not look like a self-built app id — Lark self-built app ids start with cli_.",
+      "the card must report the blocking reason"
+    );
+    assert.ok(!statusText.includes("Flip the switch"), "must not claim the setup is ready to enable");
+    assert.ok(!statusText.includes("Feishu"), "a Lark user must not be shown Feishu copy");
+
+    // The tooltip explaining the dead test button must be translated too.
+    const testButton = card.querySelectorAll("button").find((b) => b.textContent === strings.feishuApprovalSendTest);
+    assert.equal(testButton.disabled, true, "an unusable config must not offer a test");
+    assert.equal(testButton.title, statusText, "the tooltip must give the same translated reason");
+    assert.ok(!testButton.title.includes("App ID format is invalid"), "the raw English diagnostic must not surface");
+  });
+
+  it("shows a localized secrets-save failure with the underlying cause as detail", async () => {
+    // A disk failure has nothing to do with the platform, and the writer's
+    // English diagnostic used to be shown verbatim — Feishu-branded, to a Lark
+    // user. Localized sentence first, real cause appended.
+    const strings = loadSettingsI18nForTest().en;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: false, platform: "lark", idType: "open_id", approverId: "", connectionTimeoutSeconds: 15 },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({ status: "ok", state: { status: "stopped", enabled: false, platform: "lark", configured: false, reason: "disabled", secretsStored: false, secretsConfigured: false } });
+          }
+          if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: false });
+          if (name === "feishuApproval.setSecrets") {
+            return Promise.resolve({ status: "error", code: "write-failed", message: "Secrets write failed: EACCES: permission denied, mkdir" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const toasts = [];
+    harness.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    const card = harness.content.querySelector(".feishu-approval-channel-card");
+    // The secrets row reads all four inputs (App ID, App Secret, Verification
+    // Token, Encrypt Key) before saving.
+    const inputs = card.querySelectorAll("input");
+    inputs[0].value = "cli_app";
+    inputs[1].value = "app-secret";
+    inputs[2].value = "";
+    inputs[3].value = "";
+    card.querySelectorAll("button").find((b) => b.textContent === strings.feishuApprovalSaveSecrets)
+      .dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(toasts.length, 1);
+    assert.equal(
+      toasts[0].message,
+      "Could not save Lark secrets. (Secrets write failed: EACCES: permission denied, mkdir)"
+    );
+    assert.ok(!toasts[0].message.includes("Feishu"), "a Lark user must not be shown Feishu branding");
+  });
+
+  it("treats a half-written secrets file as incomplete, not ready", async () => {
+    // status.secretsStored is true for ANY stored secret. Only App ID (no App
+    // Secret), or only a Verification Token, must never read as a finished
+    // setup: readiness says missing-secret, so the switch and the copy have to
+    // agree with it.
+    const strings = loadSettingsI18nForTest().en;
+    for (const [label, secretInfo, state] of [
+      [
+        "app id only",
+        { configured: false, appId: "cli_......abcd", appSecret: "" },
+        { status: "stopped", enabled: true, platform: "lark", configured: false, reason: "missing-secret", message: "App ID and App Secret are not configured", secretsStored: true, secretsConfigured: false },
+      ],
+      [
+        "verification token only",
+        { configured: false, appId: "", appSecret: "" },
+        { status: "stopped", enabled: true, platform: "lark", configured: false, reason: "missing-secret", message: "App ID and App Secret are not configured", secretsStored: true, secretsConfigured: false },
+      ],
+    ]) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+          feishuApproval: { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+        },
+        settingsAPI: {
+          command: (name) => {
+            if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+            if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+            if (name === "feishuApproval.status") return Promise.resolve({ status: "ok", state });
+            if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", ...secretInfo });
+            return Promise.resolve({ status: "ok" });
+          },
+        },
+      });
+      harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+      await Promise.resolve();
+      await Promise.resolve();
+      harness.render();
+
+      const card = harness.content.querySelector(".feishu-approval-channel-card");
+      const statusText = card.querySelector(".tg-approval-channel-status-text").textContent;
+      assert.equal(statusText, "Save Lark app credentials below to continue.", `${label}: card must ask for credentials`);
+      assert.ok(!statusText.includes("Flip the switch"), `${label}: must not claim ready to enable`);
+
+      // The enable switch must not be operable on an incomplete credential set.
+      const sw = card.querySelectorAll(".switch")[0];
+      assert.equal(sw.classList.contains("disabled"), true, `${label}: enable switch must be disabled`);
+      assert.equal(sw.getAttribute("aria-disabled"), "true", `${label}: switch must be marked disabled`);
+
+      // And step 3 must list app credentials as still missing.
+      const prereq = card.querySelector(".tg-approval-prereq-row");
+      assert.ok(prereq, `${label}: prerequisites row should render`);
+      assert.match(prereq.querySelectorAll(".row-desc")[0].textContent, /app credentials/, `${label}: prereq lists credentials`);
+    }
+  });
+
+  it("keeps 'ready to enable' for a valid config whose switch is simply off", async () => {
+    // readiness() short-circuits on `disabled` before it ever inspects the App
+    // ID, so a switched-off config must keep its normal copy — the blocking
+    // reason path must not swallow it.
+    const strings = loadSettingsI18nForTest().en;
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: false, platform: "feishu", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "stopped", enabled: false, platform: "feishu", configured: false, reason: "disabled", message: "", secretsStored: true },
+            });
+          }
+          if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: true, appId: "cli_......abcd" });
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const statusText = harness.content.querySelector(".feishu-approval-channel-card")
+      .querySelector(".tg-approval-channel-status-text").textContent;
+    assert.equal(statusText, strings.feishuApprovalCardReadyToEnable);
+  });
+
+  it("translates a connection timeout and falls back to the raw SDK error otherwise", async () => {
+    const strings = loadSettingsI18nForTest().en;
+    // The brand comes from the saved config (what the user picked), so the
+    // snapshot platform must track the case under test.
+    async function statusText(state) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+          feishuApproval: {
+            enabled: true,
+            platform: state.platform,
+            idType: "open_id",
+            approverId: "ou_1",
+            connectionTimeoutSeconds: state.connectionTimeoutSeconds,
+          },
+        },
+        settingsAPI: {
+          command: (name) => {
+            if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+            if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+            if (name === "feishuApproval.status") return Promise.resolve({ status: "ok", state });
+            if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: true, appId: "cli_......abcd" });
+            return Promise.resolve({ status: "ok" });
+          },
+        },
+      });
+      harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+      await Promise.resolve();
+      await Promise.resolve();
+      harness.render();
+      return harness.content.querySelector(".feishu-approval-channel-card")
+        .querySelector(".tg-approval-channel-status-text").textContent;
+    }
+
+    // Our own timeout carries a code -> real copy, with the brand and the
+    // configured timeout filled in. Wrong-platform lands here first.
+    const timeout = await statusText({
+      status: "failed",
+      enabled: true,
+      platform: "lark",
+      configured: true,
+      errorCode: "connection-timeout",
+      message: "Long connection timed out after 15000ms. Check app credentials, long connection event subscription, and network.",
+      connectionTimeoutSeconds: 15,
+      secretsStored: true,
+    });
+    assert.equal(timeout, "Could not reach Lark within 15s. Check that the platform above matches your app, then the App ID / App Secret and your network.");
+    assert.ok(!timeout.includes("15000ms"), "the raw English diagnostic must not surface");
+
+    const reconnect = await statusText({
+      status: "failed", enabled: true, platform: "feishu", configured: true,
+      errorCode: "reconnect-timeout", message: "Long reconnect timed out after 30000ms.", connectionTimeoutSeconds: 30, secretsStored: true,
+    });
+    assert.match(reconnect, /Lost the Feishu long connection and could not reconnect within 30s/);
+
+    // An SDK failure has no code; showing the upstream string beats hiding the
+    // only clue the user has.
+    const sdk = await statusText({
+      status: "failed", enabled: true, platform: "lark", configured: true,
+      errorCode: "", message: "app ticket is invalid", connectionTimeoutSeconds: 15, secretsStored: true,
+    });
+    assert.equal(sdk, "app ticket is invalid");
+  });
+
+  it("maps readiness reason codes to localized, brand-aware toasts", async () => {
+    // Previously these fell through to main's raw English Feishu-branded
+    // message, which is wrong copy for a Lark user.
+    const strings = loadSettingsI18nForTest().en;
+    const testResults = [
+      { status: "error", code: "invalid-secret", message: "App ID format is invalid" },
+      { status: "error", code: "missing-secret", message: "App ID and App Secret are not configured" },
+      { status: "error", code: "invalid-config", message: "Approver id is not configured" },
+      { status: "error", code: "disabled", message: "Remote approval is disabled" },
+    ];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+        feishuApproval: { enabled: true, platform: "lark", idType: "open_id", approverId: "ou_1", connectionTimeoutSeconds: 15 },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramApproval.status") return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: false } });
+          if (name === "telegramApproval.tokenInfo") return Promise.resolve({ status: "ok", configured: false, masked: "" });
+          if (name === "feishuApproval.status") {
+            return Promise.resolve({ status: "ok", state: { status: "running", configured: true, secretsStored: true, platform: "lark" } });
+          }
+          if (name === "feishuApproval.secretInfo") return Promise.resolve({ status: "ok", configured: true, appId: "cli_......abcd" });
+          if (name === "feishuApproval.test") return Promise.resolve(testResults.shift());
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const toasts = [];
+    harness.core.ops.showToast = (message, options) => toasts.push({ message, options });
+    const testButton = harness.content.querySelector(".feishu-approval-channel-card")
+      .querySelectorAll("button")
+      .find((button) => button.textContent === strings.feishuApprovalSendTest);
+    for (let i = 0; i < 4; i += 1) {
+      testButton.dispatchEvent({ type: "click" });
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+
+    assert.deepStrictEqual(toasts.map((toast) => toast.message), [
+      "That App ID does not look like a self-built app id — Lark self-built app ids start with cli_.",
+      "App ID and App Secret are not saved yet.",
+      "The Lark approval config is incomplete — check the approver user id.",
+      "Lark approval is turned off.",
+    ]);
+    for (const toast of toasts) {
+      assert.deepStrictEqual(JSON.parse(JSON.stringify(toast.options)), { error: true });
+      assert.ok(!toast.message.includes("Feishu"), `Lark user must not be shown Feishu copy: ${toast.message}`);
+      assert.ok(!toast.message.includes("{brand}"), "no raw token may reach the user");
+    }
+  });
+
+  it("expands only whitelisted hosts in Feishu/Lark guide links", async () => {
+    const harness = loadTelegramApprovalTabForTest({});
+    const probe = [
+      // Feishu near-misses
+      "[evil](https://open.feishu.cn.evil.com/x)",
+      "[good](https://open.feishu.cn/app)",
+      "[userinfo](https://evil.com@open.feishu.cn/app)",
+      "[hyphen](https://open-feishu.cn/app)",
+      // Lark near-misses: the same attacks must be blocked on the new host.
+      "[larkEvil](https://open.larksuite.com.evil.com/x)",
+      "[larkGood](https://open.larksuite.com/app)",
+      "[larkUserinfo](https://evil.com@open.larksuite.com/app)",
+      // An unescaped "." in the whitelist would let this hyphen host through.
+      "[larkHyphen](https://open-larksuite.com/app)",
+      "[larkSub](https://evil.open.larksuite.com/app)",
+      // Non-https and arbitrary custom domains stay out.
+      "[http](http://open.larksuite.com/app)",
+      "[custom](https://feishu.example.com/app)",
+      "[tg](https://t.me/x)",
+      "[html <b>label</b>](https://open.feishu.cn/lbl)",
+    ].join(" ");
+    const originalT = harness.core.helpers.t;
+    harness.core.helpers.t = (key) => (key === "feishuApprovalEventSubStep1Html" ? probe : originalT(key));
+    harness.render();
+
+    const guideRow = harness.content.querySelector(".feishu-approval-event-sub-row");
+    const hrefs = guideRow.querySelectorAll("a").map((a) => a.getAttribute("href"));
+    assert.deepStrictEqual(hrefs, [
+      "https://open.feishu.cn/app",
+      "https://open.larksuite.com/app",
+      "https://t.me/x",
+      "https://open.feishu.cn/lbl",
+    ]);
+
+    // The source whitelist must keep both official hosts, each with its dots
+    // escaped — an unescaped "." is what would admit open-larksuite.com.
+    const approvalTabSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-telegram-approval.js"), "utf8");
+    assert.ok(approvalTabSource.includes("open\\.feishu\\.cn"), "escapeWithLink whitelist should allow open.feishu.cn");
+    assert.ok(approvalTabSource.includes("open\\.larksuite\\.com"), "escapeWithLink whitelist should allow open.larksuite.com");
+  });
+
+  it("points the guide at the official console of the selected platform only", async () => {
+    // Replaces the old hardcoded startsWith("https://open.feishu.cn/") check:
+    // render each platform and assert it links to that platform's console and
+    // never the other one.
+    for (const [platform, expected, forbidden] of [
+      ["feishu", "https://open.feishu.cn/", "larksuite.com"],
+      ["lark", "https://open.larksuite.com/", "feishu.cn"],
+    ]) {
+      const harness = loadTelegramApprovalTabForTest({
+        snapshot: {
+          tgApproval: { enabled: false, allowedTgUserId: "", targetSessionKey: "" },
+          feishuApproval: { enabled: false, platform, idType: "open_id", approverId: "", connectionTimeoutSeconds: 15 },
+        },
+      });
+      // Use the real strings so the {consoleUrl}/{brand} tokens are exercised.
+      const strings = loadSettingsI18nForTest().en;
+      harness.core.helpers.t = (key) => (key in strings ? strings[key] : key);
+      harness.render();
+
+      const guideRow = harness.content.querySelector(".feishu-approval-event-sub-row");
+      const hrefs = guideRow.querySelectorAll("a").map((a) => a.getAttribute("href"));
+      assert.equal(hrefs.length, 1, `${platform}: guide should render exactly one console link`);
+      assert.ok(hrefs[0].startsWith(expected), `${platform}: guide link must be on ${expected}, got ${hrefs[0]}`);
+      assert.ok(!hrefs[0].includes(forbidden), `${platform}: guide link must not point at ${forbidden}`);
+
+      // No unresolved token may reach the user.
+      const guideText = collectText(guideRow);
+      assert.ok(guideText.length > 0, `${platform}: sanity: the guide must render some text`);
+      assert.ok(!guideText.includes("{consoleUrl}"), `${platform}: {consoleUrl} must be interpolated`);
+      assert.ok(!guideText.includes("{brand}"), `${platform}: {brand} must be interpolated`);
+    }
   });
 
   it("refreshes Feishu status while long connection is starting", async () => {
@@ -2711,29 +4019,50 @@ describe("settings renderer browser environment", () => {
   it("renders the Settings language picker as a dropdown over all supported langs", () => {
     const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
-    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    const pickerSource = fs.readFileSync(LANGUAGE_PICKER_JS, "utf8");
+    const pickerCss = fs.readFileSync(LANGUAGE_PICKER_CSS, "utf8");
+    const settingsHtml = fs.readFileSync(SETTINGS_HTML, "utf8");
 
     assert.ok(new RegExp(
       String.raw`const LANGUAGE_OPTIONS = \[` +
       SUPPORTED_LANGS.map((lang) => String.raw`"${lang}"`).join(String.raw`,\s*`) +
       String.raw`\];`
     ).test(generalSource));
-    assert.ok(generalSource.includes(`class="language-picker"`));
-    assert.ok(generalSource.includes(`aria-haspopup="listbox"`));
-    assert.ok(generalSource.includes(`role="listbox"`));
-    assert.ok(generalSource.includes(`aria-hidden="true"`));
-    assert.ok(generalSource.includes(`role", "option"`));
-    assert.ok(!generalSource.includes(`<select class="language-select"`));
+    assert.ok(generalSource.includes("createLanguagePicker"));
+    assert.ok(pickerSource.includes(`className = "language-picker"`));
+    assert.ok(pickerSource.includes(`aria-haspopup", "listbox"`));
+    assert.ok(pickerSource.includes(`role", "listbox"`));
+    assert.ok(pickerSource.includes(`aria-hidden", "true"`));
+    assert.ok(pickerSource.includes(`role", "option"`));
+    assert.ok(settingsHtml.includes(`href="language-picker.css"`));
+    assert.ok(settingsHtml.includes(`src="language-picker.js"`));
     assert.ok(!generalSource.includes("language-segmented"));
     assert.ok(!generalSource.includes("runtime.languageTransition"));
     assert.ok(!generalSource.includes("--language-active-index"));
     assert.ok(!coreSource.includes("languageTransition"));
-    assert.ok(/\.language-picker-menu\s*\{[\s\S]*box-shadow:/.test(css));
-    assert.ok(/\.language-picker-option:hover,[\s\S]*\.language-picker-option:focus-visible\s*\{[\s\S]*background:/.test(css));
-    assert.ok(/\.language-picker-option\.selected\s*\{[\s\S]*color:\s*var\(--accent\);/.test(css));
-    assert.ok(/@media \(prefers-color-scheme:\s*dark\)\s*\{[\s\S]*\.language-picker-menu/.test(css));
-    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.language-picker-trigger,[\s\S]*\.language-picker-chevron,[\s\S]*\.language-picker-menu[\s\S]*transition:\s*none;/.test(css));
-    assert.ok(!css.includes(".language-segmented"));
+    assert.ok(/\.language-picker-menu\s*\{[\s\S]*box-shadow:/.test(pickerCss));
+    assert.ok(/\.language-picker-option:hover\s*\{[\s\S]*background:/.test(pickerCss));
+    assert.ok(/\.language-picker-option:focus-visible\s*\{[\s\S]*outline:\s*2px solid var\(--text-primary,\s*var\(--text\)\);[\s\S]*outline-offset:\s*-2px;[\s\S]*background:/.test(pickerCss));
+    assert.ok(/\.language-picker-option\.selected\s*\{[\s\S]*color:\s*var\(--accent\);/.test(pickerCss));
+    assert.ok(/@media \(prefers-color-scheme:\s*dark\)\s*\{[\s\S]*\.language-picker-menu/.test(pickerCss));
+    assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.language-picker-trigger,[\s\S]*\.language-picker-chevron,[\s\S]*\.language-picker-menu[\s\S]*transition:\s*none;/.test(pickerCss));
+    assert.ok(/@media \(forced-colors:\s*active\)\s*\{[\s\S]*\.language-picker-trigger:focus-visible,[\s\S]*\.language-picker-option:focus-visible\s*\{[\s\S]*outline-color:\s*Highlight;/.test(pickerCss));
+    assert.ok(!pickerCss.includes(".language-segmented"));
+  });
+
+  it("lets the open language picker escape its section without changing closed-card clipping", () => {
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    const sectionRowsRule = css.match(/\.section-rows\s*\{([^}]*)\}/);
+    const openSectionRule = css.match(/\.section:has\(\.language-picker\.open\)\s*\{([^}]*)\}/);
+    const openRowsRule = css.match(/\.section-rows:has\(\.language-picker\.open\)\s*\{([^}]*)\}/);
+
+    assert.ok(sectionRowsRule, "settings cards should retain their base clipping rule");
+    assert.match(sectionRowsRule[1], /overflow:\s*hidden;/);
+    assert.ok(openSectionRule, "the section containing an open language picker should be raised");
+    assert.match(openSectionRule[1], /position:\s*relative;/);
+    assert.match(openSectionRule[1], /z-index:\s*1;/);
+    assert.ok(openRowsRule, "the open language picker should escape the settings card");
+    assert.match(openRowsRule[1], /overflow:\s*visible;/);
   });
 
   it("populates the language picker with current selection and propagates click changes", () => {
@@ -2748,6 +4077,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(picker, "language picker should be rendered");
     assert.ok(trigger, "language picker trigger should be rendered");
     assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(trigger.attributes["aria-label"], "Language: English");
     assert.strictEqual(harness.getLangMenu().attributes["aria-hidden"], "true");
     const options = harness.getLangOptions();
     assert.strictEqual(options.length, SUPPORTED_LANGS.length);
@@ -2769,9 +4099,11 @@ describe("settings renderer browser environment", () => {
       "clicking a language option should call settingsAPI.update with the new lang"
     );
     assert.strictEqual(picker.classList.contains("open"), false);
+    assert.strictEqual(trigger.focused, true);
     assert.strictEqual(harness.getLangMenu().attributes["aria-hidden"], "true");
     for (const option of options) assert.strictEqual(option.tabIndex, -1);
     assert.strictEqual(harness.getLangValue().textContent, "Chinese");
+    assert.strictEqual(trigger.attributes["aria-label"], "Language: Chinese");
 
     trigger.dispatchEvent({ type: "click" });
     options[1].dispatchEvent({ type: "click" });
@@ -2789,6 +4121,7 @@ describe("settings renderer browser environment", () => {
       "clicking back to the committed language while pending should not submit a duplicate update"
     );
     assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(trigger.attributes["aria-label"], "Language: English");
     assert.strictEqual(options[0].attributes["aria-selected"], "true");
 
     harness.core.ops.applyChanges({
@@ -2797,6 +4130,7 @@ describe("settings renderer browser environment", () => {
     });
     assert.strictEqual(harness.getContentRenderCount(), 2);
     assert.strictEqual(harness.getLangValue().textContent, "Chinese");
+    assert.strictEqual(harness.getLangTrigger().attributes["aria-label"], "Language: Chinese");
     assert.strictEqual(harness.getLangOptions()[1].attributes["aria-selected"], "true");
   });
 
@@ -2812,11 +4146,212 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(harness.getLangPicker().classList.contains("open"), true);
     const options = harness.getLangOptions();
     options[1].dispatchEvent(createKeyboardEventForTest("Enter"));
-    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
 
     assert.deepStrictEqual(harness.updateCalls, [{ key: "lang", value: "zh" }]);
     assert.strictEqual(harness.getLangValue().textContent, "English");
+    assert.strictEqual(trigger.focused, true);
     assert.strictEqual(harness.getToastText(), "Failed: synthetic failure");
+  });
+
+  it("rolls concurrent failed language saves back to the last committed value", async () => {
+    const saves = [];
+    const changes = [];
+    const harness = loadSharedLanguagePickerForTest({
+      onChange: (next, previous) => {
+        const deferred = createDeferred();
+        saves.push(deferred);
+        changes.push({ next, previous });
+        return deferred.promise;
+      },
+    });
+
+    harness.trigger.dispatchEvent({ type: "click" });
+    harness.optionElements[1].dispatchEvent({ type: "click" });
+    harness.trigger.dispatchEvent({ type: "click" });
+    harness.optionElements[2].dispatchEvent({ type: "click" });
+    assert.strictEqual(harness.valueElement.textContent, "JA");
+    assert.deepStrictEqual(changes, [
+      { next: "zh", previous: "en" },
+      { next: "ja", previous: "en" },
+    ]);
+
+    saves[0].resolve(false);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(harness.valueElement.textContent, "JA", "stale failure keeps the latest optimistic value");
+
+    saves[1].resolve(false);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(harness.valueElement.textContent, "EN", "latest failure restores the committed value");
+  });
+
+  it("advances the rollback baseline after a concurrent language save succeeds", async () => {
+    const saves = [];
+    const harness = loadSharedLanguagePickerForTest({
+      onChange: () => {
+        const deferred = createDeferred();
+        saves.push(deferred);
+        return deferred.promise;
+      },
+    });
+
+    harness.trigger.dispatchEvent({ type: "click" });
+    harness.optionElements[1].dispatchEvent({ type: "click" });
+    harness.trigger.dispatchEvent({ type: "click" });
+    harness.optionElements[2].dispatchEvent({ type: "click" });
+
+    saves[0].resolve(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(harness.valueElement.textContent, "JA", "newer optimistic choice remains visible");
+
+    saves[1].resolve(false);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(harness.valueElement.textContent, "ZH", "failed latest choice restores the successful save");
+  });
+
+  it("flips and bounds the tutorial picker at minimum-size enlarged-text geometry", () => {
+    const harness = loadSharedLanguagePickerForTest({
+      options: ["en", "zh", "zh-TW", "ko", "ja"],
+      innerHeight: 450,
+    });
+    harness.boundary.getBoundingClientRect = () => ({ top: 52, bottom: 400 });
+    harness.trigger.getBoundingClientRect = () => ({ top: 220, bottom: 274 });
+    Object.defineProperty(harness.menu, "scrollHeight", { value: 240 });
+    Object.defineProperty(harness.menu, "offsetHeight", { value: 242 });
+    Object.defineProperty(harness.menu, "clientHeight", { value: 240 });
+
+    harness.trigger.dispatchEvent({ type: "click" });
+
+    assert.strictEqual(harness.picker.classList.contains("open-up"), true);
+    assert.strictEqual(harness.picker.classList.contains("menu-scrollable"), true);
+    assert.strictEqual(harness.menu.style.maxHeight, "162px");
+    assert.ok(parseInt(harness.menu.style.maxHeight, 10) < harness.menu.scrollHeight);
+    const css = fs.readFileSync(LANGUAGE_PICKER_CSS, "utf8");
+    assert.match(css, /\.language-picker\.menu-scrollable \.language-picker-menu\s*\{[\s\S]*overflow-y:\s*auto;/);
+    assert.match(css, /\.language-picker\.open-up \.language-picker-menu\s*\{[\s\S]*bottom:\s*calc\(100% \+ 6px\);/);
+  });
+
+  it("initially reveals and bounds the tutorial picker at 150% and 160% text scale", () => {
+    const layouts = [
+      { scale: "150%", boundaryBottom: 313.7, triggerTop: 317.1, triggerBottom: 353.1 },
+      { scale: "160%", boundaryBottom: 290.3, triggerTop: 316.6, triggerBottom: 352.6 },
+    ];
+
+    for (const layout of layouts) {
+      const harness = loadSharedLanguagePickerForTest({
+        options: ["en", "zh", "zh-TW", "ko", "ja"],
+        innerHeight: 400,
+      });
+      harness.boundary.getBoundingClientRect = () => ({ top: 52, bottom: layout.boundaryBottom });
+      harness.trigger.getBoundingClientRect = () => ({
+        top: layout.triggerTop - harness.boundary.scrollTop,
+        bottom: layout.triggerBottom - harness.boundary.scrollTop,
+      });
+      Object.defineProperty(harness.menu, "scrollHeight", { value: 160 });
+      Object.defineProperty(harness.menu, "offsetHeight", { value: 162 });
+      Object.defineProperty(harness.menu, "clientHeight", { value: 160 });
+
+      assert.ok(
+        harness.trigger.getBoundingClientRect().top > layout.boundaryBottom,
+        `${layout.scale}: regression setup must start with the trigger behind the footer`,
+      );
+
+      harness.control.ensureVisible();
+      const visibleTrigger = harness.trigger.getBoundingClientRect();
+      assert.ok(visibleTrigger.top >= 52, `${layout.scale}: trigger top stays inside the body`);
+      assert.ok(
+        visibleTrigger.bottom <= layout.boundaryBottom,
+        `${layout.scale}: trigger bottom stays inside the body`,
+      );
+
+      harness.trigger.dispatchEvent({ type: "click" });
+      assert.strictEqual(
+        harness.picker.classList.contains("open-up"),
+        true,
+        `${layout.scale}: menu flips upward`,
+      );
+      const menuBottom = visibleTrigger.top - 6;
+      const menuTop = menuBottom - parseInt(harness.menu.style.maxHeight, 10);
+      const firstOption = { top: menuTop + 6, bottom: menuTop + 36 };
+      const lastOption = { top: menuBottom - 36, bottom: menuBottom - 6 };
+      assert.ok(firstOption.top >= 52, `${layout.scale}: first option stays inside the body`);
+      assert.ok(
+        lastOption.bottom <= layout.boundaryBottom,
+        `${layout.scale}: last option stays inside the body`,
+      );
+    }
+  });
+
+  it("reflows an open tutorial picker after the window is resized", () => {
+    const harness = loadSharedLanguagePickerForTest({
+      options: ["en", "zh", "zh-TW", "ko", "ja"],
+      innerHeight: 450,
+    });
+    const layout = {
+      boundaryTop: 52,
+      boundaryBottom: 352.8,
+      triggerTop: 295.7,
+      triggerBottom: 331.7,
+    };
+    harness.boundary.getBoundingClientRect = () => ({
+      top: layout.boundaryTop,
+      bottom: layout.boundaryBottom,
+    });
+    harness.trigger.getBoundingClientRect = () => ({
+      top: layout.triggerTop - harness.boundary.scrollTop,
+      bottom: layout.triggerBottom - harness.boundary.scrollTop,
+    });
+    Object.defineProperty(harness.menu, "scrollHeight", { value: 160 });
+    Object.defineProperty(harness.menu, "offsetHeight", { value: 162 });
+    Object.defineProperty(harness.menu, "clientHeight", { value: 160 });
+
+    harness.trigger.dispatchEvent({ type: "click" });
+    assert.strictEqual(harness.picker.classList.contains("open"), true);
+    assert.strictEqual(harness.getWindowListenerCount("resize"), 1);
+
+    layout.boundaryBottom = 290.3;
+    layout.triggerTop = 316.6;
+    layout.triggerBottom = 352.6;
+    assert.ok(
+      harness.trigger.getBoundingClientRect().top > layout.boundaryBottom,
+      "regression setup must put the trigger behind the fixed footer",
+    );
+
+    harness.dispatchWindowEvent("resize");
+    harness.dispatchWindowEvent("resize");
+    assert.strictEqual(
+      harness.getPendingAnimationFrameCount(),
+      1,
+      "resize work is coalesced into one animation frame",
+    );
+    harness.flushAnimationFrames();
+
+    const visibleTrigger = harness.trigger.getBoundingClientRect();
+    assert.ok(visibleTrigger.top >= layout.boundaryTop);
+    assert.ok(visibleTrigger.bottom <= layout.boundaryBottom);
+    assert.strictEqual(harness.picker.classList.contains("open-up"), true);
+    assert.strictEqual(harness.menu.style.maxHeight, "162px");
+
+    harness.control.dispose();
+    assert.strictEqual(harness.getWindowListenerCount("resize"), 0);
+  });
+
+  it("does not show a scrollbar when an upward menu fits all language options", () => {
+    const harness = loadSharedLanguagePickerForTest({
+      options: ["en", "zh", "zh-TW", "ko", "ja"],
+      innerHeight: 600,
+    });
+    harness.boundary.getBoundingClientRect = () => ({ top: 72, bottom: 502 });
+    harness.trigger.getBoundingClientRect = () => ({ top: 445, bottom: 499 });
+    Object.defineProperty(harness.menu, "scrollHeight", { value: 160 });
+    Object.defineProperty(harness.menu, "offsetHeight", { value: 162 });
+    Object.defineProperty(harness.menu, "clientHeight", { value: 160 });
+
+    harness.trigger.dispatchEvent({ type: "click" });
+
+    assert.strictEqual(harness.picker.classList.contains("open-up"), true);
+    assert.strictEqual(harness.picker.classList.contains("menu-scrollable"), false);
+    assert.strictEqual(harness.menu.style.maxHeight, "162px");
   });
 
   it("cleans up language picker document listeners across re-renders", () => {
@@ -2825,12 +4360,36 @@ describe("settings renderer browser environment", () => {
     });
 
     harness.core.ops.requestRender({ content: true });
+    const staleOption = harness.getLangOptions()[1];
     assert.strictEqual(harness.getDocumentListenerCount("click"), 1);
     assert.strictEqual(harness.getDocumentListenerCount("keydown"), 1);
 
     harness.core.ops.requestRender({ content: true });
     assert.strictEqual(harness.getDocumentListenerCount("click"), 1);
     assert.strictEqual(harness.getDocumentListenerCount("keydown"), 1);
+
+    staleOption.dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(harness.updateCalls, []);
+  });
+
+  it("closes the language picker from outside clicks and Escape", () => {
+    const harness = loadGeneralLanguageRowForTest({
+      snapshot: { lang: "en" },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.getLangTrigger().dispatchEvent({ type: "click" });
+    assert.strictEqual(harness.getLangPicker().classList.contains("open"), true);
+
+    harness.dispatchDocumentEvent("click", { target: new FakeElement("body") });
+    assert.strictEqual(harness.getLangPicker().classList.contains("open"), false);
+
+    harness.getLangTrigger().dispatchEvent({ type: "click" });
+    harness.dispatchDocumentEvent("keydown", {
+      key: "Escape",
+      preventDefault() { this.defaultPrevented = true; },
+    });
+    assert.strictEqual(harness.getLangPicker().classList.contains("open"), false);
   });
 
   it("exposes aggregate and split bubble controls in the General tab", () => {
@@ -3045,24 +4604,40 @@ describe("settings renderer browser environment", () => {
     assert.ok(i18nSource.includes("claudeHooksDisconnectConfirmKeep"));
   });
 
-  it("wires the danger auto-pilot toggle with a confirm modal and red label", () => {
+  it("renders three permission automation modes with two confirmation-gated automatic choices", () => {
     const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
     const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
     const css = fs.readFileSync(SETTINGS_CSS, "utf8");
-    // Row is registered with danger:true and routes the enable path through a confirm.
-    assert.ok(generalSource.includes('key: "autoApproveAllPermissions"'));
-    assert.ok(generalSource.includes("danger: true"));
-    assert.ok(generalSource.includes("confirmAutoApproveAll"));
-    assert.ok(generalSource.includes("showAutoApproveAllConfirmModal"));
-    assert.ok(generalSource.includes('{ id: "enable", label: t("autoApproveAllConfirmEnable"), tone: "danger" }'));
-    // buildSwitchRow honors danger by painting the label red.
-    assert.ok(coreSource.includes("row-label-danger"));
-    assert.ok(css.includes(".row-label.row-label-danger"));
-    // Simple title + localized confirm strings exist.
-    assert.ok(i18nSource.includes('rowAutoApproveAll: "Auto-approve all requests"'));
-    assert.ok(i18nSource.includes('rowAutoApproveAll: "自动放行所有请求"'));
-    assert.ok(i18nSource.includes("autoApproveAllConfirmTitle"));
+    assert.ok(generalSource.includes("PERMISSION_AUTOMATION_OPTIONS"));
+    assert.ok(generalSource.includes('{ id: "off", labelKey: "permissionAutomationOff" }'));
+    assert.ok(generalSource.includes('{ id: "auto-tools", labelKey: "permissionAutomationAutoTools" }'));
+    assert.ok(generalSource.includes('{ id: "unattended", labelKey: "permissionAutomationUnattended" }'));
+    assert.ok(generalSource.includes('window.settingsAPI.command("setPermissionAutomationMode"'));
+    assert.ok(generalSource.includes("confirmed: true"));
+    assert.ok(generalSource.includes("showPermissionAutomationConfirmModal"));
+    assert.ok(generalSource.includes("permissionAutomationUnattendedConfirmTitle"));
+    assert.ok(generalSource.includes("permissionAutomationAutoToolsWarningDismissed"));
+    assert.ok(generalSource.includes("permissionAutomationUnattendedWarningDismissed"));
+    assert.ok(generalSource.includes("permissionAutomationAutoToolsDontShowAgain"));
+    assert.ok(generalSource.includes("permissionAutomationUnattendedDontShowAgain"));
+    assert.ok(generalSource.includes("suppressFutureConfirmation: result.checkboxChecked === true"));
+    assert.ok(generalSource.includes("isPermissionAutomationWarningDismissed(mode)"));
+    assert.ok(i18nSource.includes("permissionAutomationAutoToolsDontShowAgain"));
+    assert.ok(i18nSource.includes("permissionAutomationUnattendedDontShowAgain"));
+    assert.ok(css.includes(".settings-confirm-checkbox"));
+    assert.ok(coreSource.includes("checkboxLabel = \"\""));
+    assert.ok(coreSource.includes('checkboxInput.type = "checkbox"'));
+    assert.ok(coreSource.includes("checkboxChecked: !!(checkboxInput && checkboxInput.checked)"));
+    assert.ok(css.includes("grid-template-columns: repeat(3, minmax(0, 1fr))"));
+    assert.ok(generalSource.includes('segmented.setAttribute("role", "group")'));
+    assert.ok(generalSource.includes('segmented.setAttribute("aria-label", t("rowPermissionAutomation"))'));
+    assert.ok(generalSource.includes('btn.setAttribute("aria-pressed", selected ? "true" : "false")'));
+    assert.ok(i18nSource.includes('rowPermissionAutomation: "Permission request handling"'));
+    assert.ok(i18nSource.includes('rowPermissionAutomation: "权限请求处理"'));
+    assert.ok(i18nSource.includes("permissionAutomationAutoToolsConfirmTitle"));
+    assert.ok(i18nSource.includes("CodeBuddy"));
+    assert.ok(!generalSource.includes("autoApproveAllPermissions"));
     // Lives in its own Permissions section, not under Bubbles.
     assert.ok(generalSource.includes('t("sectionPermissions")'));
     assert.ok(i18nSource.includes('sectionPermissions: "Permissions"'));
@@ -3203,6 +4778,41 @@ describe("settings renderer browser environment", () => {
     await Promise.resolve();
     await Promise.resolve();
     assert.deepStrictEqual(updateCalls, [{ key: "sessionHudShowElapsed", value: false }]);
+  });
+
+  it("keeps the quota ring as an independent sibling of the Session HUD", async () => {
+    const harness = loadGeneralTabForTest({
+      snapshot: makeGeneralSnapshot({
+        sessionHudEnabled: false,
+        sessionHudShowQuota: true,
+        claudeQuotaCollectionEnabled: false,
+        quotaMergeSources: false,
+      }),
+      settingsAPI: {
+        getQuotaSourceCount: async () => 2,
+      },
+    });
+    harness.renderContent();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const ringEnabled = harness.getSwitch("sessionHudShowQuota");
+    const claudeCollection = harness.getSwitch("claudeQuotaCollectionEnabled");
+    const mergeSources = harness.getSwitch("quotaMergeSources");
+    const ringOptions = harness.content.querySelector(".quota-ring-option-list");
+    const hudOptions = harness.content.querySelector(".session-hud-option-list");
+    const summary = harness.core.state.mountedControls.sessionHudSummary.element;
+
+    assert.ok(ringEnabled);
+    assert.ok(claudeCollection);
+    assert.ok(mergeSources);
+    assert.ok(ringOptions);
+    assert.ok(hudOptions);
+    assert.notStrictEqual(ringOptions, hudOptions);
+    assert.strictEqual(ringEnabled.classList.contains("disabled"), false);
+    assert.strictEqual(mergeSources.classList.contains("disabled"), false);
+    assert.strictEqual(harness.getSwitchMeta("quotaMergeSources").row.style.display, "");
+    assert.strictEqual(summary.children.length, 1);
+    assert.strictEqual(summary.children[0].textContent, "HUD: off");
   });
 
   it("groups sound and volume into one collapsible control with in-place summary updates", () => {
@@ -3732,8 +5342,11 @@ describe("settings renderer browser environment", () => {
     assert.ok(/\.collapsible-group-chevron svg,\s*\.anim-override-chevron svg\s*\{[\s\S]*width:\s*16px;[\s\S]*height:\s*16px;[\s\S]*overflow:\s*visible;/.test(css));
     assert.ok(/\.collapsible-group-chevron path,\s*\.anim-override-chevron path\s*\{[\s\S]*fill:\s*none;[\s\S]*stroke:\s*currentColor;[\s\S]*stroke-width:\s*2\.2;[\s\S]*stroke-linecap:\s*round;[\s\S]*stroke-linejoin:\s*round;/.test(css));
     assert.ok(/\.collapsible-group-header:hover\s+\.collapsible-group-chevron\s*\{[\s\S]*color:\s*var\(--text-secondary\);[\s\S]*opacity:\s*0\.95;/.test(css));
-    assert.ok(/\.collapsible-group\.collapsed\s+\.collapsible-group-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(0deg\);/.test(css));
-    assert.ok(/\.collapsible-group:not\(\.collapsed\)\s+\.collapsible-group-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(90deg\);[\s\S]*color:\s*var\(--accent\);[\s\S]*opacity:\s*1;/.test(css));
+    // Child selectors, not descendant: nested groups (Feishu event-sub guide
+    // inside the channel card) must not inherit the outer group's chevron state.
+    assert.ok(/\.collapsible-group\.collapsed\s*>\s*\.collapsible-group-header\s*>\s*\.collapsible-group-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(0deg\);/.test(css));
+    assert.ok(/\.collapsible-group:not\(\.collapsed\)\s*>\s*\.collapsible-group-header\s*>\s*\.collapsible-group-chevron\s*\{[\s\S]*transform:\s*translateX\(-6px\) rotate\(90deg\);[\s\S]*color:\s*var\(--accent\);[\s\S]*opacity:\s*1;/.test(css));
+    assert.ok(!/\.collapsible-group\.collapsed\s+\.collapsible-group-chevron/.test(css), "descendant chevron selector would leak outer state into nested groups");
     assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.collapsible-group-chevron,[\s\S]*\.anim-override-chevron,[\s\S]*transition:\s*none;/.test(css));
     assert.ok(i18nSource.includes("collapsibleExpand"));
     assert.ok(i18nSource.includes("collapsibleCollapse"));
@@ -3741,6 +5354,7 @@ describe("settings renderer browser environment", () => {
 
   it("groups Theme cards and exposes theme import actions in Settings", () => {
     const tabSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-theme.js"), "utf8");
+    const generalSource = fs.readFileSync(SETTINGS_TAB_GENERAL, "utf8");
     const preloadSource = fs.readFileSync(PRELOAD_SETTINGS, "utf8");
     const settingsIpcSource = fs.readFileSync(SETTINGS_IPC, "utf8");
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
@@ -3760,6 +5374,11 @@ describe("settings renderer browser environment", () => {
     assert.ok(tabSource.includes("handleRemoveCodexPet"));
     assert.ok(tabSource.includes("themeUninstallPetLabel"));
     assert.ok(tabSource.includes('footer.className = "theme-card-footer";'));
+    assert.ok(tabSource.includes('btn.className = "theme-customize-btn";'));
+    assert.ok(tabSource.includes("function renderThemeDetail(parent, theme)"));
+    assert.ok(tabSource.includes("function supportsThemeCustomization(theme)"));
+    assert.ok(!generalSource.includes("rowPetColor"));
+    assert.ok(!generalSource.includes("petTint"));
     assert.ok(tabSource.includes('caps.powerProfile === "scripted"'));
     assert.ok(tabSource.includes("themeCapabilityFineMotion"));
     assert.ok(tabSource.includes('if (!theme.active) indicator.setAttribute("aria-hidden", "true");'));
@@ -3781,6 +5400,9 @@ describe("settings renderer browser environment", () => {
     assert.ok(css.includes(".theme-action-group"));
     assert.ok(css.includes(".theme-action-buttons"));
     assert.ok(css.includes(".theme-uninstall-btn"));
+    assert.ok(css.includes(".theme-customize-btn"));
+    assert.ok(css.includes(".theme-detail-hero"));
+    assert.ok(css.includes(".theme-customization-row"));
     assert.ok(/\.theme-card-footer\s*\{[^}]*min-height:\s*26px;[^}]*margin-top:\s*auto;[^}]*\}/.test(css));
     assert.ok(/\.theme-card-check\s*\{[^}]*white-space:\s*nowrap;[^}]*\}/.test(css));
     assert.ok(i18nSource.includes("themeImportPetZip"));
@@ -3790,6 +5412,11 @@ describe("settings renderer browser environment", () => {
     assert.ok(i18nSource.includes("toastUserThemeZipImportOk"));
     assert.ok(i18nSource.includes("toastCodexPetZipImportOk"));
     assert.ok(i18nSource.includes("toastCodexPetRemoveOk"));
+    assert.ok(i18nSource.includes("themeCustomize"));
+    assert.ok(i18nSource.includes("themeBackToPets"));
+    assert.ok(i18nSource.includes("themeAppearanceTitle"));
+    assert.ok(i18nSource.includes("rowPetAccessory"));
+    assert.ok(i18nSource.includes("accessoryCowboyHat"));
 
     const strings = loadSettingsI18nForTest();
     assert.strictEqual(strings.en.themeActionGroupCodexPets, "Codex Pets");
@@ -3800,6 +5427,12 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(strings.en.themeOpenUserThemesFolder, "Open themes folder");
     assert.strictEqual(strings.en.themeRefreshThemes, "Refresh themes");
     assert.strictEqual(strings.en.themeCapabilityFineMotion, "Fine motion");
+    assert.strictEqual(strings.en.themeCustomize, "Customize");
+    assert.strictEqual(strings.en.rowPetAccessory, "Accessory");
+    assert.strictEqual(strings.en.accessoryWizardHat, "Wizard hat");
+    assert.strictEqual(strings.zh.themeCustomize, "装扮");
+    assert.strictEqual(strings.zh.rowPetAccessory, "配饰");
+    assert.strictEqual(strings.zh.accessoryWizardHat, "巫师帽");
     assert.strictEqual(strings.zh.themeImportPetZip, "导入 Codex Pet 包（.zip）");
     assert.strictEqual(strings.zh.themeCapabilityFineMotion, "精细动效");
     assert.strictEqual(strings.zh.themeActionGroupCodexPets, "Codex Pets");
@@ -3864,6 +5497,324 @@ describe("settings renderer browser environment", () => {
     assert.deepStrictEqual(commands, []);
   });
 
+  it("keeps customization visible on every capable pet while omitting Calico", () => {
+    const supported = loadThemeTabForTest({
+      themes: [
+        {
+          id: "clawd",
+          name: "Clawd",
+          builtin: true,
+          active: true,
+          capabilities: { petTint: true },
+        },
+        {
+          id: "calico",
+          name: "Calico",
+          builtin: true,
+          active: false,
+          capabilities: { petTint: false, accessories: false },
+        },
+        {
+          id: "cloudling",
+          name: "Cloudling",
+          builtin: true,
+          active: false,
+          capabilities: { petTint: false, accessories: true },
+        },
+      ],
+    });
+    const buttons = supported.content.querySelectorAll(".theme-customize-btn");
+    assert.strictEqual(buttons.length, 2);
+    assert.deepStrictEqual(
+      buttons.map((button) => collectText(findAncestorByClass(button, "theme-card")))
+        .map((text) => (text.includes("Cloudling") ? "Cloudling" : "Clawd"))
+        .sort(),
+      ["Clawd", "Cloudling"]
+    );
+
+    const calicoActive = loadThemeTabForTest({
+      themes: [
+        {
+          id: "calico",
+          name: "Calico",
+          builtin: true,
+          active: true,
+          capabilities: { petTint: false, accessories: false },
+        },
+      ],
+    });
+    assert.strictEqual(calicoActive.content.querySelectorAll(".theme-customize-btn").length, 0);
+    assert.strictEqual(calicoActive.content.querySelector(".theme-detail-hero"), null);
+  });
+
+  it("selects an inactive capable pet and opens its customization in one click", async () => {
+    let listThemesCalls = 0;
+    const harness = loadThemeTabForTest({
+      themes: [
+        {
+          id: "clawd",
+          name: "Clawd",
+          builtin: true,
+          active: true,
+          capabilities: { petTint: true },
+        },
+        {
+          id: "cloudling",
+          name: "Cloudling",
+          builtin: true,
+          active: false,
+          capabilities: { petTint: false, accessories: true },
+        },
+      ],
+      settingsAPI: {
+        listThemes: () => {
+          listThemesCalls += 1;
+          return Promise.reject(new Error("theme enumeration unavailable"));
+        },
+      },
+    });
+    const cloudlingButton = harness.content.querySelectorAll(".theme-customize-btn")
+      .find((button) => collectText(findAncestorByClass(button, "theme-card")).includes("Cloudling"));
+    assert.ok(cloudlingButton);
+
+    cloudlingButton.dispatchEvent({ type: "click" });
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(harness.commands)),
+      [{
+        name: "setThemeSelection",
+        payload: { themeId: "cloudling" },
+      }]
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.ok(harness.content.querySelector(".theme-detail-hero"));
+    assert.ok(collectText(harness.content.querySelector(".theme-detail-heading")).includes("Cloudling"));
+    assert.ok(harness.content.querySelector(".pet-accessory-select"));
+    assert.strictEqual(harness.content.querySelector(".pet-tint-select"), null);
+    assert.strictEqual(harness.content.querySelector(".theme-grid"), null);
+    assert.strictEqual(listThemesCalls, 0, "opening details should not depend on a second theme fetch");
+  });
+
+  it("does not open stale customization when the activated runtime disables it", async () => {
+    const harness = loadThemeTabForTest({
+      themes: [
+        {
+          id: "clawd",
+          name: "Clawd",
+          builtin: true,
+          active: true,
+          capabilities: { petTint: true, accessories: true },
+        },
+        {
+          id: "custom",
+          name: "Custom",
+          builtin: false,
+          active: false,
+          capabilities: { petTint: false, accessories: true },
+        },
+      ],
+      settingsAPI: {
+        command: () => Promise.resolve({
+          status: "ok",
+          customizationCapabilities: { petTint: false, accessories: false },
+        }),
+      },
+    });
+    const customButton = harness.content.querySelectorAll(".theme-customize-btn")[1];
+    assert.ok(customButton);
+
+    customButton.dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.strictEqual(harness.content.querySelector(".theme-detail-hero"), null);
+    assert.strictEqual(harness.content.querySelector(".pet-accessory-select"), null);
+    const runtimeCustom = harness.core.runtime.themeList
+      .find((theme) => theme && theme.id === "custom");
+    assert.strictEqual(runtimeCustom.active, true);
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(runtimeCustom.capabilities)),
+      { petTint: false, accessories: false }
+    );
+    const activeCustomCard = harness.content.querySelectorAll(".theme-card")
+      .find((card) => {
+        const name = card.querySelector(".theme-card-name");
+        return name && collectText(name).includes("Custom");
+      });
+    assert.strictEqual(activeCustomCard.getAttribute("aria-checked"), "true");
+  });
+
+  it("updates customization capability after normal theme-card activation", async () => {
+    const harness = loadThemeTabForTest({
+      themes: [
+        {
+          id: "clawd",
+          name: "Clawd",
+          builtin: true,
+          active: true,
+          capabilities: { petTint: true, accessories: true },
+        },
+        {
+          id: "custom",
+          name: "Custom",
+          builtin: false,
+          active: false,
+          capabilities: { petTint: false, accessories: false },
+        },
+      ],
+      settingsAPI: {
+        command: () => Promise.resolve({
+          status: "ok",
+          customizationCapabilities: { petTint: false, accessories: true },
+        }),
+      },
+    });
+    const customCard = harness.content.querySelectorAll(".theme-card")
+      .find((card) => {
+        const name = card.querySelector(".theme-card-name");
+        return name && collectText(name).includes("Custom");
+      });
+    assert.ok(customCard);
+    assert.strictEqual(customCard.querySelector(".theme-customize-btn"), null);
+
+    customCard.dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const activeCustom = harness.core.runtime.themeList
+      .find((theme) => theme && theme.id === "custom");
+    assert.strictEqual(activeCustom.active, true);
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(activeCustom.capabilities)),
+      { petTint: false, accessories: true }
+    );
+    const rerenderedCard = harness.content.querySelectorAll(".theme-card")
+      .find((card) => {
+        const name = card.querySelector(".theme-card-name");
+        return name && collectText(name).includes("Custom");
+      });
+    assert.ok(rerenderedCard.querySelector(".theme-customize-btn"));
+  });
+
+  it("keeps existing theme cards when a refresh returns an impossible empty list", async () => {
+    const harness = loadThemeTabForTest({
+      themes: [
+        {
+          id: "clawd",
+          name: "Clawd",
+          builtin: true,
+          active: true,
+          capabilities: { petTint: true },
+        },
+      ],
+      settingsAPI: {
+        // settings:list-themes reports [] when main catches an enumeration
+        // failure, even though a healthy install always has built-in themes.
+        listThemes: () => Promise.resolve([]),
+      },
+    });
+    const previousThemeList = harness.core.runtime.themeList;
+
+    const result = await harness.core.ops.fetchThemes();
+    harness.renderContent();
+
+    assert.strictEqual(result, previousThemeList);
+    assert.strictEqual(harness.core.runtime.themeList, previousThemeList);
+    assert.strictEqual(harness.content.querySelectorAll(".theme-card").length, 1);
+  });
+
+  it("opens the active pet detail and saves color independently for that theme", async () => {
+    const harness = loadThemeTabForTest({
+      themes: [
+        {
+          id: "clawd",
+          name: "Clawd",
+          builtin: true,
+          active: true,
+          previewFileUrl: "file:///clawd.svg",
+          capabilities: { petTint: true, accessories: true },
+        },
+      ],
+      snapshot: {
+        petTint: { clawd: "matcha", cloudling: "vaporwave" },
+        petAccessory: { clawd: "wizard-hat", cloudling: "halo" },
+      },
+      petTintOptions: [
+        { id: "none", labelKey: "tintNone" },
+        { id: "midnight", labelKey: "tintMidnight" },
+        { id: "gold", labelKey: "tintGold" },
+        { id: "vaporwave", labelKey: "tintVaporwave" },
+        { id: "matcha", labelKey: "tintMatcha" },
+        { id: "mono", labelKey: "tintMono" },
+      ],
+      petAccessoryOptions: [
+        { id: "none", labelKey: "accessoryNone" },
+        { id: "cowboy-hat", labelKey: "accessoryCowboyHat" },
+        { id: "wizard-hat", labelKey: "accessoryWizardHat" },
+        { id: "halo", labelKey: "accessoryHalo" },
+      ],
+    });
+
+    harness.content.querySelector(".theme-customize-btn").dispatchEvent({ type: "click" });
+    assert.ok(harness.content.querySelector(".theme-detail-back"));
+    assert.ok(harness.content.querySelector(".theme-detail-hero"));
+    assert.strictEqual(harness.content.querySelectorAll(".theme-customization-row").length, 2);
+    assert.strictEqual(harness.content.querySelector(".theme-grid"), null);
+
+    const select = harness.content.querySelector(".pet-tint-select");
+    assert.strictEqual(select.value, "matcha");
+    assert.deepStrictEqual(
+      select.children.map((option) => option.textContent),
+      ["Default", "🌙 Midnight", "🥇 Gold", "🌸 Vaporwave", "🍵 Matcha", "⬜ Monochrome"]
+    );
+
+    select.value = "gold";
+    select.dispatchEvent({ type: "change" });
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(harness.updates)),
+      [{
+        key: "petTint",
+        value: { clawd: "gold", cloudling: "vaporwave" },
+      }]
+    );
+    assert.strictEqual(select.disabled, true);
+    assert.strictEqual(select.classList.contains("pending"), true);
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(select.disabled, false);
+    assert.strictEqual(select.classList.contains("pending"), false);
+
+    const accessorySelect = harness.content.querySelector(".pet-accessory-select");
+    assert.strictEqual(accessorySelect.value, "wizard-hat");
+    assert.deepStrictEqual(
+      accessorySelect.children.map((option) => option.textContent),
+      ["None", "Cowboy hat", "Wizard hat", "Halo"]
+    );
+    accessorySelect.value = "halo";
+    accessorySelect.dispatchEvent({ type: "change" });
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(harness.updates[1])),
+      {
+        key: "petAccessory",
+        value: { clawd: "halo", cloudling: "halo" },
+      }
+    );
+    assert.strictEqual(accessorySelect.disabled, true);
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(accessorySelect.disabled, false);
+
+    harness.content.querySelector(".theme-detail-back").dispatchEvent({ type: "click" });
+    assert.ok(harness.content.querySelector(".theme-grid"));
+    assert.strictEqual(harness.content.querySelector(".theme-detail-hero"), null);
+  });
+
   it("animates collapsible Settings groups with measured height instead of instant hidden jumps", () => {
     const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
     const css = fs.readFileSync(SETTINGS_CSS, "utf8");
@@ -3879,7 +5830,7 @@ describe("settings renderer browser environment", () => {
     assert.ok(!coreSource.includes("body.hidden = collapsed;"));
     assert.ok(/\.collapsible-group-body\s*\{[\s\S]*max-height:\s*var\(--collapsible-body-height,\s*0px\);/.test(css));
     assert.ok(/\.collapsible-group-body\s*\{[\s\S]*transition:\s*max-height 0\.22s cubic-bezier\(0\.22,\s*1,\s*0\.36,\s*1\),\s*opacity 0\.16s ease,\s*transform 0\.18s ease,\s*padding 0\.18s ease,\s*border-color 0\.18s ease;/.test(css));
-    assert.ok(/\.collapsible-group\.collapsed\s+\.collapsible-group-body\s*\{[\s\S]*opacity:\s*0;[\s\S]*transform:\s*translateY\(-4px\);/.test(css));
+    assert.ok(/\.collapsible-group\.collapsed\s*>\s*\.collapsible-group-body\s*\{[\s\S]*opacity:\s*0;[\s\S]*transform:\s*translateY\(-4px\);/.test(css));
     assert.ok(/@media \(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*\.collapsible-group-body/.test(css));
   });
 
@@ -3925,9 +5876,513 @@ describe("settings renderer browser environment", () => {
     assert.ok(agentOrderSource.includes("COLLAPSIBLE_AGENT_PRIORITY"));
     assert.ok(agentOrderSource.includes("NON_COLLAPSIBLE_AGENT_PRIORITY"));
     assert.ok(agentsSource.includes("ClawdSettingsAgentOrder"));
-    assert.ok(agentsSource.includes("sortAgentMetadataForSettings(runtime.agentMetadata"));
+    assert.ok(agentsSource.includes("sortAgentMetadataForSettings(metadata)"));
     assert.ok(agentsSource.includes("function categorizeAgentsForSections("));
-    assert.ok(agentsSource.includes("function renderAgentSections("));
+    assert.ok(agentsSource.includes("function renderConnectedSubtab("));
+    assert.ok(agentsSource.includes("function renderDiscoverSubtab("));
+  });
+
+  it("lists agents flat, with no Coding AI / Office AI grouping layer", () => {
+    const agentsSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-agents.js"), "utf8");
+    const orderSource = fs.readFileSync(path.join(SRC_DIR, "settings-agent-order.js"), "utf8");
+    const i18nSource = fs.readFileSync(path.join(SRC_DIR, "settings-i18n.js"), "utf8");
+    const css = fs.readFileSync(path.join(SRC_DIR, "settings.css"), "utf8");
+    assert.ok(agentsSource.includes("function buildAgentRows("));
+    assert.ok(!agentsSource.includes("buildAgentCategoryGroup("));
+    assert.ok(!agentsSource.includes("categorizeAgentsByType("));
+    assert.ok(!agentsSource.includes("getAgentCategory"));
+    assert.ok(!orderSource.includes("getAgentCategory"));
+    assert.ok(!i18nSource.includes("agentCategoryCoding"));
+    assert.ok(!i18nSource.includes("agentCategoryWork"));
+    assert.ok(!css.includes(".agent-category-group"));
+    assert.ok(!css.includes(".agent-category-count"));
+  });
+
+  it("counts a registered custom AI as connected, listed beside built-ins", () => {
+    const id = "custom-nova-ai-0123456789ab";
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          [id]: { integrationInstalled: false, enabled: true },
+          qoderwork: { integrationInstalled: true, enabled: true },
+        },
+        customApplications: [],
+        customToolDiscoveryPaths: [],
+      },
+      agentMetadata: [
+        {
+          id,
+          name: "Nova AI",
+          category: "code",
+          eventSource: "custom-http",
+          custom: true,
+          capabilities: {},
+        },
+        {
+          id: "qoderwork",
+          name: "QoderWork",
+          category: "work",
+          eventSource: "hook",
+          capabilities: {},
+        },
+      ],
+    });
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 1,
+      agents: [],
+      customAgents: [{ agentId: id, detectedInstalled: true, confidence: "high" }],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+
+    // Registering is what connects a custom AI, so it belongs in Connected
+    // rather than being demoted into the discover subtab. Both agents list
+    // flat: a custom "code" agent and a built-in "work" one, no category boxes.
+    const connected = harness.content.querySelector(".agent-section-connected");
+    assert.ok(connected);
+    assert.strictEqual(connected.querySelector(".agent-category-group"), null);
+    assert.deepStrictEqual(
+      connected.querySelectorAll(".agent-summary-row .row-label").map((node) => node.textContent),
+      ["Nova AI", "QoderWork"]
+    );
+    assert.strictEqual(harness.content.querySelector(".agent-section-recommended"), null);
+    // Its executable resolves, so no missing-binary badge yet.
+    assert.strictEqual(connected.querySelector(".custom-missing"), null);
+
+    // Losing the executable no longer moves the agent out of Connected, so the
+    // row itself has to report it.
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 2,
+      agents: [],
+      customAgents: [{ agentId: id, detectedInstalled: false, confidence: "high" }],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const stillConnected = harness.content.querySelector(".agent-section-connected");
+    assert.deepStrictEqual(
+      stillConnected.querySelectorAll(".agent-summary-row .row-label").map((node) => node.textContent),
+      ["Nova AI", "QoderWork"],
+      "a vanished executable must not evict the agent from Connected"
+    );
+    const missing = stillConnected.querySelector(".custom-missing");
+    assert.ok(missing, "the row reports the missing executable");
+    assert.strictEqual(missing.textContent, "Path missing");
+  });
+
+  it("renders Custom AI detection under one manual folder picker", () => {
+    const agentsSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-agents.js"), "utf8");
+    const coreSource = fs.readFileSync(path.join(SRC_DIR, "settings-ui-core.js"), "utf8");
+    const preloadSource = fs.readFileSync(PRELOAD_SETTINGS, "utf8");
+    const css = fs.readFileSync(path.join(SRC_DIR, "settings.css"), "utf8");
+
+    assert.ok(coreSource.includes("function readCustomToolDetectionResults("));
+    assert.ok(coreSource.includes("function readCustomAgentDetectionResults("));
+    assert.ok(coreSource.includes("hints.customTools"));
+    assert.ok(agentsSource.includes("function buildCustomToolResultRows("));
+    assert.ok(agentsSource.includes("readCustomToolDetectionResults"));
+    assert.ok(agentsSource.includes('className = "row row-sub custom-tool-result-row"'));
+    assert.ok(agentsSource.includes("pickAgentDiscoveryPath"));
+    assert.ok(preloadSource.includes('ipcRenderer.invoke("settings:pick-agent-discovery-path"'));
+    assert.ok(agentsSource.includes('pickAgentDiscoveryPath("directory")'));
+    assert.ok(!agentsSource.includes('labelKey: "rowAgentDiscoveryPaths"'));
+    assert.ok(agentsSource.includes('await ops.fetchAgentInstallationHints({ force: true })'));
+    assert.ok(agentsSource.includes("function buildWslScanControl("));
+    assert.ok(agentsSource.includes('control.className = "custom-tool-wsl-scan"'));
+    assert.ok(!agentsSource.includes('toolbar.className = "agent-scan-toolbar"'));
+    assert.ok(css.includes(".custom-tool-result-status"));
+    assert.match(css, /\.agent-custom-tools-section \.custom-tool-discovery-row\s*\{[^}]*flex-direction:\s*column;/s);
+    // The primary picker must keep a higher-specificity selector than the
+    // generic `.soft-btn.accent` tinted rule that follows it, or the cascade
+    // falls back to source order and drops the solid accent fill.
+    assert.match(css, /\.agent-custom-tools-section \.soft-btn\.custom-tool-path-picker\s*\{[^}]*background:\s*var\(--accent\);/s);
+    assert.ok(!/\.custom-tool-path-picker\s*\{[^}]*width:\s*100%;/s.test(css));
+    assert.ok(!/\.custom-tool-scan\s*\{[^}]*width:\s*100%;/s.test(css));
+  });
+
+  it("filters the undetected catalog from its header search box", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        lang: "en",
+        agents: {
+          "gemini-cli": { integrationInstalled: false, enabled: false },
+          "kimi-code": { integrationInstalled: false, enabled: false },
+          "qwen-code": { integrationInstalled: false, enabled: false },
+        },
+        customToolDiscoveryPaths: [],
+      },
+      agentMetadata: [
+        { id: "gemini-cli", name: "Gemini CLI", eventSource: "hook", capabilities: {} },
+        { id: "kimi-code", name: "Kimi Code", eventSource: "hook", capabilities: {} },
+        { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: {} },
+      ],
+    });
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 1,
+      agents: [],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const group = harness.content.querySelector(".agent-unavailable-group");
+    assert.ok(group, "undetected agents render as a collapsible catalog");
+    assert.ok(group.classList.contains("collapsed"), "catalog starts collapsed");
+    const search = group.querySelector(".agent-section-search");
+    assert.ok(search, "the catalog header carries a search box");
+    assert.strictEqual(search.placeholder, "Search");
+    assert.strictEqual(group.querySelector(".agent-section-count").textContent, "3");
+
+    const visibleNames = () => group
+      .querySelectorAll(".agent-summary-row .row-label")
+      .filter((label) => {
+        let node = label;
+        while (node) {
+          if (node.classList && node.classList.contains("agent-row-filtered-out")) return false;
+          node = node.parentNode;
+        }
+        return true;
+      })
+      .map((label) => label.textContent);
+    assert.deepStrictEqual(visibleNames(), ["Gemini CLI", "Kimi Code", "Qwen Code"]);
+
+    search.value = "kim";
+    search.dispatchEvent({ type: "input", target: search, bubbles: false });
+    harness.raf.flush();
+
+    assert.deepStrictEqual(visibleNames(), ["Kimi Code"]);
+    assert.strictEqual(group.querySelector(".agent-section-count").textContent, "1");
+    // Typing has to open the catalog, or it would filter rows nobody can see.
+    assert.strictEqual(group.classList.contains("collapsed"), false);
+
+    // Clicks and keystrokes inside the box must not toggle the group.
+    const wasCollapsed = group.classList.contains("collapsed");
+    search.dispatchEvent({ type: "click", target: search, bubbles: true });
+    search.dispatchEvent({ type: "keydown", key: "Enter", target: search, bubbles: true });
+    assert.strictEqual(group.classList.contains("collapsed"), wasCollapsed);
+
+    // An IME composition is pinyin keystrokes, not a query: filtering on it
+    // would empty the list under the candidate window mid-word.
+    search.value = "kimi";
+    search.dispatchEvent({ type: "input", target: search, bubbles: false });
+    search.dispatchEvent({ type: "compositionstart", target: search, bubbles: false });
+    search.value = "ki mi";
+    search.dispatchEvent({ type: "input", target: search, bubbles: false });
+    assert.deepStrictEqual(visibleNames(), ["Kimi Code"], "composition keystrokes must not filter");
+    assert.strictEqual(group.querySelector(".agent-section-count").textContent, "1");
+    search.value = "秘密";
+    search.dispatchEvent({ type: "compositionend", target: search, bubbles: false });
+    assert.deepStrictEqual(visibleNames(), [], "the committed characters do filter");
+    assert.strictEqual(group.querySelector(".agent-section-count").textContent, "0");
+
+    // The query survives a re-render, and matching is case-insensitive.
+    search.value = "QWEN";
+    search.dispatchEvent({ type: "input", target: search, bubbles: false });
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+    const rebuilt = harness.content.querySelector(".agent-unavailable-group");
+    assert.strictEqual(rebuilt.querySelector(".agent-section-search").value, "QWEN");
+    assert.strictEqual(rebuilt.querySelector(".agent-section-count").textContent, "1");
+  });
+
+  it("splits the Agents tab into connected and discover subtabs", () => {
+    const customPath = "C:\\Tools\\Unknown";
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        lang: "en",
+        agents: {
+          "qwen-code": { integrationInstalled: true, enabled: true },
+          "gemini-cli": { integrationInstalled: false, enabled: false },
+        },
+        customToolDiscoveryPaths: [customPath],
+        dismissedAgentCleanupHints: {},
+        dismissedAgentInstallHints: {},
+      },
+      agentMetadata: [
+        { id: "qwen-code", name: "Qwen Code", eventSource: "hook", capabilities: {} },
+        { id: "gemini-cli", name: "Gemini CLI", eventSource: "hook", capabilities: {} },
+      ],
+    });
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 1700000000000,
+      agents: [
+        // Connected but gone from disk -> cleanup hint on the connected subtab.
+        { agentId: "qwen-code", detectedInstalled: false, confidence: "high" },
+        // On disk but not connected -> install hint + badge on the discover pill.
+        { agentId: "gemini-cli", detectedInstalled: true, confidence: "high" },
+      ],
+      customTools: [{
+        path: customPath,
+        detectedInstalled: true,
+        confidence: "medium",
+        reason: "custom-path",
+        detail: "No launchable application was recognized",
+        kind: "directory",
+      }],
+      skippedAgentIds: [],
+      wslSupported: true,
+      wslDistros: [],
+    };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const subtabs = harness.content.querySelector(".agents-subtabs");
+    assert.ok(subtabs, "the Agents tab should render a subtab switcher");
+    const pills = subtabs.querySelectorAll(".segmented button");
+    assert.deepStrictEqual(pills.map((pill) => pill.textContent), ["Connected", "Discover and add"]);
+    assert.strictEqual(pills[0].classList.contains("active"), true);
+    assert.strictEqual(pills[0].getAttribute("aria-selected"), "true");
+    // The badge counts what can be acted on now, not the whole catalog.
+    assert.strictEqual(pills[0].querySelector(".agents-subtab-count"), null);
+    assert.strictEqual(pills[1].querySelector(".agents-subtab-count").textContent, "1");
+
+    // Connected is the default half, and the WSL rescan rides with it: its
+    // results land as instance rows inside agent cards, not as discovery hits.
+    const connectedSection = harness.content.querySelector(".agent-section-connected");
+    assert.ok(connectedSection);
+    // Only one category here, so the grouping layer is dropped entirely
+    // instead of wrapping the rows in a lone "Coding AI" header.
+    assert.strictEqual(connectedSection.querySelector(".agent-category-group"), null);
+    assert.deepStrictEqual(
+      connectedSection.querySelectorAll(".agent-summary-row .row-label").map((node) => node.textContent),
+      ["Qwen Code"]
+    );
+    assert.ok(subtabs.querySelector(".custom-tool-wsl-scan"));
+    assert.strictEqual(harness.content.querySelector(".custom-tool-path-picker"), null);
+    assert.strictEqual(harness.content.querySelector(".agent-custom-tools-section"), null);
+
+    // Each banner belongs to the subtab it acts on.
+    const cleanupIndex = harness.content.children
+      .findIndex((node) => node.classList.contains("agent-cleanup-hint-banner"));
+    assert.ok(cleanupIndex >= 0, "a cleanup hint should render for the missing local agent");
+    assert.ok(cleanupIndex > harness.content.children.indexOf(subtabs));
+    assert.strictEqual(harness.content.querySelector(".agent-install-hint-banner"), null);
+
+    pills[1].dispatchEvent({ type: "click", bubbles: false });
+    harness.raf.flush();
+
+    const discoverSubtabs = harness.content.querySelector(".agents-subtabs");
+    const discoverPills = discoverSubtabs.querySelectorAll(".segmented button");
+    assert.strictEqual(discoverPills[1].classList.contains("active"), true);
+    assert.ok(harness.content.querySelector(".custom-tool-path-picker"));
+    assert.strictEqual(harness.content.querySelector(".agent-section-connected"), null);
+    assert.strictEqual(discoverSubtabs.querySelector(".custom-tool-wsl-scan"), null);
+    assert.strictEqual(harness.content.querySelector(".agent-cleanup-hint-banner"), null);
+    assert.ok(harness.content.querySelector(".agent-install-hint-banner"));
+
+    // The pill is the only heading for this half, and an unrecognized path
+    // states its status once, localized, with no badge repeating it.
+    assert.strictEqual(harness.content.querySelector(".agent-custom-tools-section .section-title"), null);
+    const resultRow = harness.content.querySelector(".custom-tool-result-row");
+    assert.strictEqual(resultRow.querySelector(".custom-tool-result-path").textContent, customPath);
+    assert.strictEqual(resultRow.querySelector(".custom-tool-result-path").title, customPath);
+    assert.strictEqual(resultRow.querySelector(".row-desc").textContent, "No launchable application found");
+    assert.strictEqual(resultRow.querySelector(".custom-tool-result-status"), null);
+  });
+
+  it("shows custom AI scan state and forces a rescan", async () => {
+    let resolveScan;
+    let scanCalls = 0;
+    const harness = loadAgentsTabForTest({
+      snapshot: { lang: "en", agents: {}, customToolDiscoveryPaths: [] },
+      agentMetadata: [],
+      settingsAPI: {
+        detectAgentInstallations: () => {
+          scanCalls += 1;
+          return new Promise((resolve) => { resolveScan = resolve; });
+        },
+      },
+    });
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 1700000000000,
+      agents: [],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const button = harness.content.querySelector(".custom-tool-scan");
+    const status = harness.content.querySelector(".custom-tool-scan-status");
+    assert.strictEqual(button.textContent, "Rescan");
+    assert.match(status.textContent, /^Last scanned at /);
+
+    button.dispatchEvent({ type: "click", bubbles: false });
+    assert.strictEqual(status.textContent, "Scanning...");
+    assert.strictEqual(button.disabled, true);
+    assert.strictEqual(scanCalls, 1);
+
+    resolveScan({
+      checkedAt: 1700000005000,
+      agents: [],
+      customTools: [],
+      skippedAgentIds: [],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1250));
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.match(status.textContent, /^Last scanned at /);
+    assert.strictEqual(button.disabled, false);
+  });
+
+  it("adds a picked installation folder, persists it, and waits for a fresh path scan", async () => {
+    const calls = [];
+    const pickedPath = "C:\\Tools\\CustomAI";
+    const harness = loadAgentsTabForTest({
+      snapshot: { agents: {}, customToolDiscoveryPaths: [] },
+      agentMetadata: [],
+      settingsAPI: {
+        pickAgentDiscoveryPath: async (kind) => {
+          calls.push(["pick", kind]);
+          return { status: "ok", path: pickedPath };
+        },
+        command: async (command, payload) => {
+          calls.push(["command", command, payload]);
+          return { status: "ok" };
+        },
+        detectAgentInstallations: async () => {
+          calls.push(["scan"]);
+          return {
+            checkedAt: 123,
+            agents: [],
+            customTools: [{
+              path: pickedPath,
+              detectedInstalled: true,
+              confidence: "medium",
+              reason: "custom-path",
+              detail: "Path exists (directory)",
+              kind: "directory",
+            }],
+          };
+        },
+      },
+    });
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.runtime.agentInstallationHints = {
+      checkedAt: 1,
+      agents: [],
+      customTools: [],
+      skippedAgentIds: [],
+    };
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const picker = harness.content.querySelector(".custom-tool-path-picker");
+    assert.strictEqual(picker.textContent, "Choose AI installation folder");
+    assert.strictEqual(harness.content.querySelector(".agent-custom-tools-section input"), null);
+    picker.dispatchEvent({ type: "click", bubbles: false });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    harness.raf.flush();
+
+    assert.deepStrictEqual(calls[0], ["pick", "directory"]);
+    assert.strictEqual(calls[1][0], "command");
+    assert.strictEqual(calls[1][1], "setAgentCustomDiscoveryPaths");
+    assert.strictEqual(calls[1][2].agentId, "custom");
+    assert.deepStrictEqual(calls[1][2].value, [pickedPath]);
+    assert.deepStrictEqual(calls[2], ["scan"]);
+    assert.strictEqual(harness.core.runtime.agentInstallationHints.customTools[0].path, pickedPath);
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+    assert.ok(harness.content.querySelector(".custom-tool-result-found"));
+    const removePath = harness.content.querySelector(".custom-tool-remove-path");
+    assert.ok(removePath);
+    removePath.dispatchEvent({ type: "click", bubbles: false });
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    assert.strictEqual(calls[3][0], "command");
+    assert.strictEqual(calls[3][1], "setAgentCustomDiscoveryPaths");
+    assert.deepStrictEqual(calls[3][2].value, []);
+  });
+
+  it("registers a recognized custom AI with state-only connection details", async () => {
+    const id = "custom-nova-ai-0123456789ab";
+    const pickedPath = "C:\\Tools\\NovaAI.exe";
+    const calls = [];
+    let added = false;
+    const customMetadata = {
+      id,
+      name: "Nova AI",
+      category: "code",
+      eventSource: "custom-http",
+      custom: true,
+      sourcePath: pickedPath,
+      executablePath: pickedPath,
+      processName: "NovaAI.exe",
+      stateEndpoint: "http://127.0.0.1:23333/state",
+      lastStateEvent: null,
+      capabilities: { httpHook: true, permissionApproval: false, interactiveBubble: false, notificationHook: true },
+    };
+    const detection = () => ({
+      checkedAt: 1,
+      agents: [],
+      customTools: [{
+        path: pickedPath,
+        detectedInstalled: true,
+        confidence: "high",
+        reason: "application-recognized",
+        detail: "Recognized Nova AI",
+        kind: "file",
+        application: { ...customMetadata, added },
+      }],
+      skippedAgentIds: [],
+    });
+    const harness = loadAgentsTabForTest({
+      snapshot: { agents: {}, customToolDiscoveryPaths: [pickedPath], customApplications: [] },
+      agentMetadata: [],
+      settingsAPI: {
+        command: async (command, payload) => {
+          calls.push([command, payload]);
+          if (command === "addCustomApplication") added = true;
+          return { status: "ok" };
+        },
+        listAgents: async () => added ? [customMetadata] : [],
+        detectAgentInstallations: async () => detection(),
+      },
+    });
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.runtime.agentInstallationHints = detection();
+    harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const addButton = harness.content.querySelector(".custom-tool-add");
+    assert.ok(addButton);
+    addButton.dispatchEvent({ type: "click", bubbles: false });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    harness.raf.flush();
+
+    assert.strictEqual(calls[0][0], "addCustomApplication");
+    assert.strictEqual(calls[0][1].path, pickedPath);
+    assert.ok(harness.core.runtime.agentMetadata.some((agent) => agent.id === id));
+    assert.ok(harness.content.querySelector(".custom-agent-remove"));
+    assert.ok(harness.content.querySelector(".custom-registration"));
+    assert.ok(harness.content.querySelector(".custom-agent-copy"));
+    assert.strictEqual(
+      harness.content
+        .querySelectorAll(".agent-badge")
+        .some((badge) => badge.classList.contains("accent")),
+      false
+    );
+
+    const activity = harness.content.querySelector(".custom-agent-activity");
+    assert.ok(!activity.textContent.includes("PreToolUse"));
+    const renderCountBeforeActivity = harness.getContentRenderCount();
+    assert.strictEqual(harness.core.tabs.agents.applyAgentActivity({
+      agentId: id,
+      timestamp: Date.UTC(2026, 6, 21, 8, 30, 0),
+      eventType: "PreToolUse",
+    }), true);
+    assert.ok(activity.textContent.includes("PreToolUse"));
+    assert.strictEqual(harness.core.runtime.agentMetadata[0].lastStateEvent.eventType, "PreToolUse");
+    assert.strictEqual(harness.getContentRenderCount(), renderCountBeforeActivity);
   });
 
   it("keeps Agent management capability-driven for Gemini wait-for-input alerts", () => {
@@ -3998,7 +6453,7 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(calls, 1);
   });
 
-  it("groups agents into connected, recommended, and unavailable sections", () => {
+  it("splits connected agents from detected and undetected ones across the subtabs", () => {
     const harness = loadAgentsTabForTest({
       snapshot: {
         agents: {
@@ -4027,20 +6482,40 @@ describe("settings renderer browser environment", () => {
 
     harness.core.ops.requestRender({ content: true });
 
+    const labelsFor = (section) => section.querySelectorAll(".agent-summary-row .row-label").map((el) => el.textContent);
+
+    // Connected subtab: only the connected agents, and no section title —
+    // the pill already says "Connected".
     const connected = harness.content.querySelector(".agent-section-connected");
+    assert.ok(connected);
+    assert.strictEqual(connected.querySelector(".section-title"), null);
+    assert.deepStrictEqual(labelsFor(connected), ["Hermes Agent"]);
+    assert.strictEqual(harness.content.querySelector(".agent-section-recommended"), null);
+    assert.strictEqual(harness.content.querySelector(".agent-section-unavailable"), null);
+
+    harness.core.runtime.agentsSubtab = "discover";
+    harness.core.ops.requestRender({ content: true });
+
     const recommended = harness.content.querySelector(".agent-section-recommended");
     const unavailable = harness.content.querySelector(".agent-section-unavailable");
-    assert.ok(connected);
     assert.ok(recommended);
     assert.ok(unavailable);
-    assert.strictEqual(connected.querySelector(".section-title").textContent, "Connected");
     assert.strictEqual(recommended.querySelector(".section-title").textContent, "Detected locally");
-    assert.strictEqual(unavailable.querySelector(".section-title").textContent, "Not detected locally");
-
-    const labelsFor = (section) => section.querySelectorAll(".agent-summary-row .row-label").map((el) => el.textContent);
-    assert.deepStrictEqual(labelsFor(connected), ["Hermes Agent"]);
     assert.deepStrictEqual(labelsFor(recommended), ["Qwen Code"]);
+    assert.strictEqual(harness.content.querySelector(".agent-section-connected"), null);
+
+    // The undetected catalog is a collapsed group with a neutral count, and
+    // the manual-add block sits above it.
+    const group = unavailable.querySelector(".agent-unavailable-group");
+    assert.ok(group);
+    assert.strictEqual(group.querySelector(".collapsible-group-text .row-label").textContent, "Not detected locally");
+    assert.strictEqual(group.querySelector(".agent-section-count").textContent, "1");
+    assert.ok(group.classList.contains("collapsed"));
     assert.deepStrictEqual(labelsFor(unavailable), ["Pi"]);
+    assert.ok(
+      harness.content.children.indexOf(harness.content.querySelector(".agent-custom-tools-section"))
+      < harness.content.children.indexOf(unavailable)
+    );
   });
 
   it("renders an install hint banner for detected local agents that are not integrated", () => {
@@ -4067,6 +6542,7 @@ describe("settings renderer browser environment", () => {
       skippedAgentIds: ["claude-code", "codex"],
     };
     harness.core.runtime.agentInstallationHintsFetched = true;
+    harness.core.runtime.agentsSubtab = "discover";
 
     harness.core.ops.requestRender({ content: true });
 
@@ -4669,6 +7145,47 @@ describe("settings renderer browser environment", () => {
     assert.ok(permissionsSwitch, "CodeBuddy permission switch should still be mounted");
   });
 
+  it("does not render a permission toggle on the WorkBuddy row (state-only, #618)", () => {
+    // The desktop app owns the permission loop in its native sandbox + GUI, so
+    // capabilities.permissionApproval is false and the row must offer no
+    // permission switch — only the notification (waiting) toggle.
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          workbuddy: {
+            enabled: true,
+            notificationHookEnabled: true,
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "workbuddy",
+        name: "WorkBuddy",
+        eventSource: "hook",
+        capabilities: {
+          notificationHook: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:workbuddy": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const permissionsSwitch = [...harness.core.state.mountedControls.agentSwitches.values()]
+      .find((meta) => meta.agentId === "workbuddy" && meta.flag === "permissionsEnabled");
+    assert.strictEqual(
+      permissionsSwitch,
+      undefined,
+      "WorkBuddy is state-only, so no permission toggle should be mounted"
+    );
+    const notificationSwitch = [...harness.core.state.mountedControls.agentSwitches.values()]
+      .find((meta) => meta.agentId === "workbuddy" && meta.flag === "notificationHookEnabled");
+    assert.ok(notificationSwitch, "WorkBuddy waiting-notification switch should still be mounted");
+  });
+
   it("slides the Codex permission mode pill when mode broadcasts patch in place", () => {
     const harness = loadAgentsTabForTest({
       snapshot: {
@@ -4833,6 +7350,7 @@ describe("settings renderer browser environment", () => {
       snapshot: {
         agents: {
           "gemini-cli": {
+            integrationInstalled: true,
             enabled: true,
             notificationHookEnabled: true,
           },
@@ -4991,15 +7509,31 @@ describe("settings renderer browser environment", () => {
     );
   });
 
-  it("drops the cached animation/sound card data when the map subtab patches a theme-override change", () => {
+  it("invalidates animation cards and refreshes theme capabilities after a map override patch", async () => {
+    let listThemesCalls = 0;
     const harness = loadAnimMapTabForTest({
       snapshot: {
         theme: "clawd",
         themeOverrides: { clawd: { states: { error: { disabled: false } } } },
       },
+      settingsAPI: {
+        listThemes: () => {
+          listThemesCalls++;
+          return Promise.resolve([{
+            id: "clawd",
+            active: true,
+            capabilities: { petTint: true, accessories: false },
+          }]);
+        },
+      },
     });
     // Simulate having opened the Animations subtab earlier: its card data is cached.
     harness.core.runtime.animationOverridesData = { theme: { id: "clawd" }, cards: [], sounds: [] };
+    harness.core.runtime.themeList = [{
+      id: "clawd",
+      active: true,
+      capabilities: { petTint: true, accessories: true },
+    }];
     // A mounted map switch so patchMapInPlace takes the in-place themeOverrides branch.
     const sw = new FakeElement("div");
     sw.className = "switch on";
@@ -5019,6 +7553,13 @@ describe("settings renderer browser environment", () => {
       harness.core.runtime.animationOverridesData,
       null,
       "a map-subtab theme-override patch must invalidate the cached cards so Animations/Sounds refetch"
+    );
+    assert.strictEqual(listThemesCalls, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(
+      harness.core.runtime.themeList[0].capabilities.accessories,
+      false,
+      "the registered map-tab fast path must not leave Theme capability metadata stale"
     );
   });
 
@@ -5479,6 +8020,87 @@ describe("settings renderer browser environment", () => {
 
     assert.strictEqual(patchCount, 1);
     assert.strictEqual(contentRenderCount, 0);
+  });
+
+  it("renders the idle visual picker and submits setIdleVisual for the chosen option", async () => {
+    const commandCalls = [];
+    const runtime = createIdleVisualRuntime();
+    const modalRoot = new FakeElement("div");
+    const { core, document } = loadAnimOverridesTabForTest({
+      runtime,
+      modalRoot,
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    const parent = new FakeElement("main");
+    document.body.appendChild(parent);
+    core.tabs.animOverrides.render(parent, core);
+
+    assert.strictEqual(parent.querySelectorAll(".anim-idle-visual-row").length, 1);
+    const valueEl = parent.querySelector(".anim-idle-visual-row .language-picker-value");
+    assert.strictEqual(valueEl.textContent, "animIdleVisualThemeDefault");
+    const options = parent.querySelectorAll(".anim-idle-visual-row .language-picker-option");
+    assert.strictEqual(options.length, 2);
+
+    options[1].dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    assert.strictEqual(commandCalls.length, 1);
+    assert.strictEqual(commandCalls[0].name, "setIdleVisual");
+    // spread: the payload object comes from the VM realm, whose Object
+    // prototype fails deepStrictEqual against test-realm literals.
+    assert.deepStrictEqual(
+      { ...commandCalls[0].payload },
+      { themeId: "clawd", file: "clawd-idle-reading.svg" }
+    );
+    assert.strictEqual(valueEl.textContent, "Idle Reading", "optimistic display should show the pick immediately");
+  });
+
+  it("patches idleVisual-only broadcasts in place and re-syncs the mounted picker", () => {
+    const runtime = createIdleVisualRuntime();
+    const modalRoot = new FakeElement("div");
+    const { core, document } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+    document.body.appendChild(parent);
+    core.tabs.animOverrides.render(parent, core);
+    const valueEl = parent.querySelector(".anim-idle-visual-row .language-picker-value");
+    assert.strictEqual(valueEl.textContent, "animIdleVisualThemeDefault");
+
+    const handled = core.tabs.animOverrides.patchInPlace({ idleVisual: { clawd: "clawd-idle-reading.svg" } });
+    assert.strictEqual(handled, true, "idleVisual-only broadcast must not trigger a full re-render");
+    assert.strictEqual(runtime.animationOverridesData.idleDefaultVisual.selectedFile, "clawd-idle-reading.svg");
+    assert.strictEqual(valueEl.textContent, "Idle Reading");
+
+    const handledReset = core.tabs.animOverrides.patchInPlace({ idleVisual: {} });
+    assert.strictEqual(handledReset, true);
+    assert.strictEqual(runtime.animationOverridesData.idleDefaultVisual.selectedFile, null);
+    assert.strictEqual(valueEl.textContent, "animIdleVisualThemeDefault");
+  });
+
+  it("cleans up idle visual picker document listeners through the mounted-control dispose contract", () => {
+    const runtime = createIdleVisualRuntime();
+    const modalRoot = new FakeElement("div");
+    const { core, document, documentListenerCount } = loadAnimOverridesTabForTest({ runtime, modalRoot });
+    const parent = new FakeElement("main");
+    document.body.appendChild(parent);
+    core.tabs.animOverrides.render(parent, core);
+
+    assert.strictEqual(documentListenerCount("click"), 1);
+    assert.strictEqual(documentListenerCount("keydown"), 1);
+    const picker = core.state.mountedControls.idleVisualPicker;
+    assert.strictEqual(typeof picker.dispose, "function");
+    picker.dispose();
+    assert.strictEqual(documentListenerCount("click"), 0);
+    assert.strictEqual(documentListenerCount("keydown"), 0);
+
+    // settings-ui-core owns calling dispose between renders — pin that wiring.
+    const uiCoreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    assert.ok(uiCoreSource.includes("state.mountedControls.idleVisualPicker.dispose()"));
+    assert.ok(uiCoreSource.includes("state.mountedControls.idleVisualPicker = null;"));
+    assert.ok(uiCoreSource.includes("idleVisualPicker: null,"));
   });
 
   it("renders visible loading text for the initial Animation Overrides fetch", () => {
@@ -6701,6 +9323,64 @@ describe("settings renderer browser environment", () => {
       "unrelated themeOverrides broadcasts should fall through to a full content refresh"
     );
     assert.strictEqual(fetchCount, 1);
+  });
+
+  it("refreshes cached theme capabilities after Animation Overrides changes", async () => {
+    let themeFetches = 0;
+    const core = loadSettingsCoreForTest({
+      listThemes: () => {
+        themeFetches++;
+        return Promise.resolve([{
+          id: "custom",
+          name: "Custom",
+          active: true,
+          capabilities: { petTint: false, accessories: false },
+        }]);
+      },
+      getAnimationOverridesData: () => Promise.resolve({
+        theme: { id: "custom", name: "Custom" },
+        assets: [],
+        sections: [],
+        cards: [],
+        sounds: [],
+      }),
+    });
+    core.state.activeTab = "animOverrides";
+    core.state.snapshot = { theme: "custom", themeOverrides: {} };
+    core.runtime.themeList = [{
+      id: "custom",
+      name: "Custom",
+      active: true,
+      capabilities: { petTint: false, accessories: true },
+    }];
+    core.ops.installRenderHooks({
+      sidebar: () => {},
+      content: () => {},
+      modal: () => {},
+    });
+
+    const nextSnapshot = {
+      theme: "custom",
+      themeOverrides: {
+        custom: {
+          states: {
+            idle: { sourceThemeId: "custom", file: "replacement.svg" },
+          },
+        },
+      },
+    };
+    core.ops.applyChanges({
+      changes: { themeOverrides: nextSnapshot.themeOverrides },
+      snapshot: nextSnapshot,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.strictEqual(themeFetches, 1);
+    assert.strictEqual(
+      core.runtime.themeList[0].capabilities.accessories,
+      false,
+      "returning to Theme must not reuse capability metadata from before the override"
+    );
   });
 
   it("routes matching Animation Overrides timing broadcasts through applyChanges in place", () => {
